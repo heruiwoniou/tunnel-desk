@@ -107,6 +107,10 @@ impl ActiveSession {
         self.cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.done.notified()).await;
     }
+
+    fn completion(&self) -> Arc<tokio::sync::Notify> {
+        self.done.clone()
+    }
 }
 
 struct Running {
@@ -118,7 +122,7 @@ pub struct TunnelManager {
     store: AppStore,
     secrets: Arc<dyn SecretStore>,
     resolver: Resolver,
-    running: Mutex<HashMap<String, Running>>,
+    running: Arc<Mutex<HashMap<String, Running>>>,
     watch: watch::Sender<Vec<TunnelSnapshot>>,
 }
 
@@ -129,7 +133,7 @@ impl TunnelManager {
             store,
             secrets,
             resolver,
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
             watch,
         }
     }
@@ -205,6 +209,7 @@ impl TunnelManager {
                     outcome: "connected".into(),
                     message: sanitize_secret(&snapshot.message, secret_view.as_deref()),
                 })?;
+                let watch_history = history_id.clone();
                 self.running.lock().expect("running").insert(
                     profile.id.clone(),
                     Running {
@@ -212,6 +217,47 @@ impl TunnelManager {
                         history_id,
                     },
                 );
+                let done = self
+                    .running
+                    .lock()
+                    .expect("running")
+                    .get(&profile.id)
+                    .expect("inserted")
+                    .session
+                    .completion();
+                let watch_running = Arc::clone(&self.running);
+                let watch_store = self.store.clone();
+                let watch_sender = self.watch.clone();
+                let watch_id = profile.id.clone();
+                tokio::spawn(async move {
+                    done.notified().await;
+                    let phase = watch_running
+                        .lock()
+                        .expect("running")
+                        .get(&watch_id)
+                        .map(|running| running.session.snapshot().phase);
+                    if phase == Some(Phase::Failed) {
+                        if let Ok(mut history) = watch_store.load_history() {
+                            if let Some(entry) =
+                                history.iter_mut().find(|entry| entry.id == watch_history)
+                            {
+                                if entry.ended_at.is_none() {
+                                    entry.ended_at = Some(now_rfc3339());
+                                    entry.outcome = "failed".into();
+                                    entry.message = "SSH 连接已中断，监听端口已释放".into();
+                                }
+                            }
+                            let _ = watch_store.save_history(&history);
+                        }
+                        let snapshots: Vec<TunnelSnapshot> = watch_running
+                            .lock()
+                            .expect("running")
+                            .values()
+                            .map(|running| running.session.snapshot())
+                            .collect();
+                        let _ = watch_sender.send(snapshots);
+                    }
+                });
                 self.publish();
                 Ok(ConnectOutcome {
                     snapshot: self
@@ -325,24 +371,52 @@ impl TunnelManager {
         remember: bool,
         warnings: &mut Vec<AppError>,
     ) -> Result<Option<Zeroizing<String>>, AppError> {
+        let identities = match self.identity_paths(profile) {
+            Ok(paths) => paths,
+            Err(err) => {
+                if typed.is_some() {
+                    return Err(err);
+                }
+                warnings.push(err);
+                return Ok(None);
+            }
+        };
         if let Some(passphrase) = typed {
             if remember {
-                let identities = self.identity_paths(profile)?;
                 if identities.is_empty() {
                     warnings.push(AppError::new(
                         "keyring_unavailable",
                         "没有具体的密钥文件，无法把口令保存到钥匙串",
                     ));
                 }
-                for path in identities {
-                    let account = secrets::key_passphrase_account(&profile.id, &path);
+                for path in &identities {
+                    let account = secrets::key_passphrase_account(&profile.id, path);
                     if let Err(err) = self.secrets.set(&account, &passphrase) {
+                        warnings.push(err);
+                        break;
+                    }
+                }
+            } else {
+                for path in &identities {
+                    let account = secrets::key_passphrase_account(&profile.id, path);
+                    if let Err(err) = self.secrets.delete(&account) {
                         warnings.push(err);
                         break;
                     }
                 }
             }
             return Ok(Some(passphrase));
+        }
+        for path in identities {
+            let account = secrets::key_passphrase_account(&profile.id, &path);
+            match self.secrets.get(&account) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(err) => {
+                    warnings.push(err);
+                    break;
+                }
+            }
         }
         Ok(None)
     }
@@ -724,6 +798,7 @@ async fn run_session(
     snapshot: Arc<Mutex<TunnelSnapshot>>,
     cancel: CancellationToken,
 ) -> Result<LiveRuntime, AppError> {
+    let lost = Arc::new(tokio::sync::Notify::new());
     let config = Arc::new(client_config());
     let mut kept = Vec::new();
     let mut proxies = Vec::new();
@@ -756,6 +831,7 @@ async fn run_session(
             },
             accept_forwards: last,
             cancel: cancel.clone(),
+            session_lost: lost.clone(),
         };
         let mut handle = connect_hop(
             config.clone(),
@@ -778,7 +854,6 @@ async fn run_session(
     }
     let handle = current.ok_or_else(|| AppError::new("ssh", "没有可用的 SSH 会话"))?;
     set_phase(&snapshot, Phase::Binding, "正在绑定端口映射", None);
-    let lost = Arc::new(tokio::sync::Notify::new());
     let mut statuses = Vec::new();
     let mut listeners = Vec::new();
     for forward in spec
@@ -846,10 +921,9 @@ async fn run_session(
     }
     for (listener, forward) in listeners {
         let shared = shared.clone();
-        let lost = lost.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
-            local_accept_loop(listener, shared, forward, lost, cancel).await;
+            local_accept_loop(listener, shared, forward, cancel).await;
         });
     }
     Ok(LiveRuntime {
@@ -908,16 +982,14 @@ async fn local_accept_loop(
     listener: TcpListener,
     handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
     forward: ValidatedForward,
-    lost: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => {
-                let Ok((socket, peer)) = accepted else { break };
+                let Ok((mut socket, peer)) = accepted else { break };
                 let handle = handle.clone();
-                let lost = lost.clone();
                 let cancel = cancel.clone();
                 let destination_host = forward.destination_host.clone();
                 let destination_port = forward.destination_port;
@@ -933,7 +1005,12 @@ async fn local_accept_loop(
                     };
                     match opened {
                         Ok(channel) => bridge_tcp(socket, channel, cancel).await,
-                        Err(_) => lost.notify_one(),
+                        // OpenSSH rejects the channel when the destination refuses.
+                        // That closes this TCP client only. The session and the
+                        // other listeners stay up.
+                        Err(_) => {
+                            let _ = socket.shutdown().await;
+                        }
                     }
                 });
             }
@@ -992,6 +1069,7 @@ struct ClientHandler {
     remote_rules: Vec<RemoteRule>,
     accept_forwards: bool,
     cancel: CancellationToken,
+    session_lost: Arc<tokio::sync::Notify>,
 }
 
 impl Handler for ClientHandler {
@@ -1063,6 +1141,19 @@ impl Handler for ClientHandler {
                 let _ = crate::store::save_trust_file(&self.trust_path, &snapshot);
                 Ok(true)
             }
+        }
+    }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        if !self.cancel.is_cancelled() {
+            self.session_lost.notify_one();
+        }
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            client::DisconnectReason::Error(err) => Err(err),
         }
     }
 
@@ -1508,6 +1599,11 @@ fn set_phase(
     snap.message = message.to_string();
     if let Some(forwards) = forwards {
         snap.forwards = forwards;
+    } else if matches!(phase, Phase::Failed | Phase::Disconnected) {
+        for forward in &mut snap.forwards {
+            forward.state = "stopped".into();
+            forward.message = message.to_string();
+        }
     }
 }
 

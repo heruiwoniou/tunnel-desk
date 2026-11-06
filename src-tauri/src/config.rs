@@ -381,8 +381,7 @@ impl Accumulator {
                 .unwrap_or(false),
             proxy_jump,
             proxy_command,
-            identity_agent: optional_none(self.scalars.get("identityagent"))
-                .map(|value| expand_tilde(&value, &resolver.home)),
+            identity_agent: agent_setting(self.scalars.get("identityagent"), &resolver.home),
             known_hosts_files,
             preferred_authentications: self
                 .scalars
@@ -510,8 +509,7 @@ fn parse_ssh_g(text: &str, resolver: &Resolver, query: &str) -> ResolvedHost {
         identities_only: first("identitiesonly").as_deref() == Some("yes"),
         proxy_jump: optional_none(scalars.get("proxyjump")),
         proxy_command: optional_none(scalars.get("proxycommand")),
-        identity_agent: optional_none(scalars.get("identityagent"))
-            .map(|value| expand_tilde(&value, &resolver.home)),
+        identity_agent: agent_setting(scalars.get("identityagent"), &resolver.home),
         known_hosts_files,
         preferred_authentications: first("preferredauthentications")
             .map(|value| {
@@ -525,6 +523,19 @@ fn parse_ssh_g(text: &str, resolver: &Resolver, query: &str) -> ResolvedHost {
         resolution: "openssh".into(),
         warnings,
     }
+}
+
+/// `IdentityAgent none` disables the agent. Unlike ProxyCommand, the word
+/// `none` is a real setting and must not collapse to "use the default agent".
+fn agent_setting(value: Option<&String>, home: &Path) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(expand_tilde(trimmed, home))
+        }
+    })
 }
 
 fn optional_none(value: Option<&String>) -> Option<String> {
@@ -851,6 +862,7 @@ Host dest other
   Port 2222
   IdentityFile ~/.ssh/id_ed25519
   ProxyJump jump
+  IdentityAgent none
   LocalForward 127.0.0.1:8080 localhost:80
 
 Host *.internal
@@ -886,6 +898,7 @@ Host jump
         assert_eq!(resolved.port, 2222);
         assert_eq!(resolved.identity_files.len(), 2);
         assert_eq!(resolved.proxy_jump.as_deref(), Some("jump"));
+        assert_eq!(resolved.identity_agent.as_deref(), Some("none"));
         assert!(
             resolved
                 .warnings

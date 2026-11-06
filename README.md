@@ -4,6 +4,8 @@ TunnelDesk 是一个跨平台桌面 SSH 端口转发工具。它在本机用 Rus
 
 当前版本 `0.1.0`。本仓库是桌面应用源码，不是网站。
 
+这台 Linux 虚拟机验证过的是 Linux 路径。Windows 和 macOS 的代码与打包配置已经按目标写好，但没有在对应系统上编译或运行。下面的「支持」和「本机已验证」是两张不同的表。
+
 ## 环境要求
 
 - Rust stable，`rustc` **不低于 1.90**（本机验证用的是 1.99.1）。不要用更旧的工具链，工程使用 edition 2024。
@@ -15,11 +17,11 @@ TunnelDesk 是一个跨平台桌面 SSH 端口转发工具。它在本机用 Rus
   - `librsvg2-dev`
   - `patchelf`
   - `libsecret-1-dev`（编译期链接 Secret Service）
-  - 运行期记住密码还需要可用的 Secret Service，例如已解锁的 `gnome-keyring`。没有钥匙串时应用拒绝保存密码，不会改成明文。
+  - 运行期记住密码还需要已解锁的 Secret Service，例如 `gnome-keyring`。没有钥匙串时应用拒绝保存密码，不会改成明文。
 - macOS 需要 Xcode 命令行工具。记住密码使用钥匙串（Keychain）。
 - Windows 需要 WebView2。SSH 配置默认读 `%USERPROFILE%\.ssh\config`。记住密码使用凭据管理器（Credential Manager）。
 
-本机没有签名证书。不要把下面的 Linux 包描述成已签名或已公证的 Windows / macOS 安装包。
+本机没有签名证书。不要把 Linux 包描述成已签名或已公证的 Windows / macOS 安装包。
 
 ## 架构
 
@@ -36,7 +38,7 @@ Rust：配置解析、校验、钥匙串、known_hosts、隧道会话、托盘
 - 服务器密码和私钥口令留在进程内存里，用 `zeroize` 包住，不进入命令行参数、环境变量或 shell。
 - 主机密钥检查在回调里完成，不能被某个 `-o StrictHostKeyChecking=no` 关掉。
 - `-L` 是本机监听后走 `direct-tcpip`；`-R` 是 `tcpip-forward` / `forwarded-tcpip`。监听是否成功决定连接阶段，不会“进程起来了就算已连接”。
-- 失败时取消监听并断开会话，避免留下孤儿转发。
+- 失败时取消监听并断开会话，避免留下孤儿转发。单个目标拒绝连接只关掉这一条 TCP，不拆掉整个会话。
 
 主机别名优先用本机 OpenSSH：
 
@@ -44,7 +46,7 @@ Rust：配置解析、校验、钥匙串、known_hosts、隧道会话、托盘
 ssh -T [-F 文件] -G -- 目标
 ```
 
-`-T` 避免分配终端。不附加 `BatchMode`，也不从界面拼接任意 `-o`。`ssh -G` 不可用时，内置解析器负责列出别名和解析，并写出它没有处理的项。
+`-T` 避免分配终端。不附加 `BatchMode`，也不从界面拼接任意 `-o`。`ssh -G` 不可用时，内置解析器负责列出别名和解析，并写出它没有处理的项。传输实际使用的是解析后的主机、端口、用户、身份文件、`ProxyJump` 和 `ProxyCommand`。解析结果里出现但传输不支持的选项会被拒绝或标明，而不是悄悄忽略后假装兼容全部 OpenSSH 配置。
 
 数据目录（配置、历史、设置、应用自己的主机信任）在 Tauri 的应用数据目录。开发时可以用 `TUNNELDESK_DATA_DIR` 指到别的目录。这个目录里只有 JSON，没有密码。
 
@@ -52,20 +54,20 @@ ssh -T [-F 文件] -G -- 目标
 
 记住的秘密只进操作系统钥匙串：
 
-| 平台 | 设施 |
-| --- | --- |
-| macOS | Keychain |
-| Windows | Credential Manager |
-| Linux | Secret Service（gnome-keyring 等） |
+| 平台 | 设施 | 本机是否做过存取 |
+| --- | --- | --- |
+| macOS | Keychain | 否 |
+| Windows | Credential Manager | 否 |
+| Linux | Secret Service（gnome-keyring 等） | 是，独立一次性钥匙串 |
 
-实现是 `keyring` 4.2（`v1` API）。服务名 `dev.tunneldesk.app`。账号名是 `server-password:<规则 id>` 和 `key-passphrase:<规则 id>:<身份文件路径的 SHA-256>`。服务器密码和私钥口令分开存放。
+实现是 `keyring` 4.2，只开 `v1`（`default-features = false`）。这个 feature 按编译目标选择后端：macOS `apple-native-keyring-store`，Windows `windows-native-keyring-store`，Linux `zbus-secret-service-keyring-store`。不要再打开 `db-keystore` 或 `linux-keyutils`。服务名与包标识相同，都是 `dev.tunneldesk.desktop`。账号名是 `server-password:<规则 id>` 和 `key-passphrase:<规则 id>:<身份文件路径的 SHA-256>`。服务器密码和私钥口令分开存放。`IdentityAgent none` 会关掉代理，不会退回 `SSH_AUTH_SOCK`。
 
-前端只能看到“已保存 / 未保存”。用户当场输入的密码只在连接或保存时传到后端，界面随后清空。钥匙串不可用或已锁定时，保存失败，并说明原因。不会写入 JSON、SQLite、历史、localStorage、日志、环境变量或命令行，也没有明文备用文件。
+前端只能看到“已保存 / 未保存”。用户当场输入的密码只在连接时传到后端，界面随后清空。钥匙串不可用或已锁定时，保存失败，并说明原因。不会写入 JSON、SQLite、历史、localStorage、日志、环境变量或命令行，也没有明文备用文件。
 
 其他边界：
 
 - 只读 `~/.ssh/config` 和 `known_hosts`，不改写它们，也不改 `sshd`、`GatewayPorts` 或防火墙。
-- 未知主机密钥必须在界面里明确信任。已变化或已吊销的密钥直接拒绝，不会自动替换。应用自己的信任记录在单独的 `trust.json`。
+- 未知主机密钥必须在界面里明确信任。已变化或已吊销的密钥直接拒绝，不会自动替换。应用自己的信任记录在单独的 `trust.json`。哈希过的 `known_hosts` 可以信任。
 - 证书密钥（`@cert-authority`、主机证书）不当作普通公钥信任。
 - 监听地址默认回环。写成 `0.0.0.0` 或 `::` 必须勾选对外暴露，并看到警告。
 - 别名、主机、用户、路径、跳板和端口都做校验，拒绝空格、控制字符和把额外选项塞进字段。
@@ -109,7 +111,7 @@ Windows 上配置路径是用户配置目录下的 `.ssh/config`。
 
 服务器上的 `127.0.0.1` 只在那台服务器自己可见。若要让别的机器连上远程转发，需要服务器管理员自己改 `GatewayPorts` 或防火墙。TunnelDesk 不会去改。
 
-一条规则可以有多条映射。任一监听失败（端口被占用，或服务器拒绝 `tcpip-forward`）时，已经打开的监听会撤掉，会话断开，状态不会停在“已连接”。
+一条规则可以有多条映射。任一监听失败（端口被占用，或服务器拒绝 `tcpip-forward`）时，已经打开的监听会撤掉，会话断开，状态不会停在“已连接”。目标端口拒绝连接时，只结束这一次 TCP，会话和其他监听保持。会话本身断开（对端关闭）时，状态变为失败，监听被释放，历史记为失败，规则仍留在列表里。
 
 ## 开发
 
@@ -142,81 +144,98 @@ npm run build
 npm run tauri build -- --bundles deb
 ```
 
-产物在 `src-tauri/target/release/bundle/deb/`。本机这次得到 `TunnelDesk_0.1.0_amd64.deb`，3,267,180 字节。包内二进制约 7.3 MB。未签名。本环境的 AppImage / fuse 依赖不完整，所以打包目标只设了 `deb`。
+产物在 `src-tauri/target/release/bundle/deb/`。本机这次得到 `TunnelDesk_0.1.0_amd64.deb`，3,273,362 字节。包内二进制 `tunneldesk` 7,322,232 字节。未签名。本环境的 AppImage / fuse 依赖不完整，所以实际打出来的只有 `deb`。
 
-在对应系统上可以打其他包，本仓库没有在那些系统上执行：
+`tauri.conf.json` 的 `bundle.targets` 列出了 `deb`、`app`、`dmg`、`nsis`、`msi`，这只是打包配置，不是那些系统上已经成功的构建。在对应系统上可以执行：
 
 ```bash
 npm run tauri build -- --bundles app          # macOS
 npm run tauri build -- --bundles msi nsis     # Windows
 ```
 
-`.github/workflows/ci.yml` 是一份 Ubuntu / macOS / Windows 的检查与打包模板。Origin 草稿不会运行 GitHub Actions。它不是一次已经通过的 CI。
+`.github/workflows/ci.yml` 是一份 Ubuntu / macOS / Windows 的检查与打包模板。Origin 草稿不会运行 GitHub Actions。它不是一次已经通过的 CI，也不能当成原生构建通过。
 
-包标识 `dev.tunneldesk.app` 以 `.app` 结尾。Tauri 会警告这和 macOS 的应用包扩展名容易混淆。Linux 的 deb 不受影响。真正打 macOS 包之前应改成不以 `.app` 结尾的标识。
+包标识是 `dev.tunneldesk.desktop`，不以 `.app` 结尾。钥匙串服务名使用同一个字符串，并有测试锁住两者一致。
 
 ## 密码、钥匙串和忘记
 
-连接对话框把服务器密码和私钥口令分成两个字段。勾选记住之后，后端写入钥匙串。下次连接可以不再输入。
+连接对话框把服务器密码和私钥口令分成两个字段。勾选记住之后，后端写入钥匙串。下次连接可以不再输入。再次连接时，若规则仍标记为记住密码，会从钥匙串读出服务器密码；私钥口令同样按身份文件分开读取。
 
 钥匙串不可用或已锁定时：
 
 - 记住开关不可用，并说明 Linux 需要 Secret Service，且不会把密码存成明文。
 - 本次仍然可以手动输入密码来连接。这次输入不会落盘。
-- 已勾选记住、但钥匙串写入失败时，连接仍使用这次输入的密码，历史和界面里不会出现密码本身。
+- 已勾选记住、但钥匙串写入失败时，连接仍使用这次输入的密码，历史和界面里不会出现密码本身。读钥匙串失败会变成警告，不会挡住当场输入的密码。
 
 规则详情里的“忘记密码”删除该规则的服务器密码。设置里可以忘记已信任的主机。钥匙串里的条目由 Rust 删除；前端没有删除接口可以碰到明文。
 
 没有钥匙串时不要期待自动重连出密码。这是故意的。
 
+在一次性钥匙串里验证过的做法（不要对现有用户的钥匙串做这件事）：新建空的 `HOME`，在 `dbus-run-session` 里用 `gnome-keyring-daemon --unlock` 再 `--start --components=secrets`，然后设置 `TUNNELDESK_KEYRING_TEST=1` 跑 `os_keyring_password_authenticates`。这个测试会保存、用保存的密码对临时 OpenSSH 认证、再忘记并确认下一次要求密码。未设置该环境变量时，这个测试立刻返回，不接触任何钥匙串。
+
 ## 托盘
 
 菜单包含：显示窗口、最多 16 条规则的连接或断开、断开全部、退出。隐藏窗口不会拆掉正在跑的隧道。退出和“断开全部”会断开本应用拥有的会话并释放监听。
 
-关闭按钮的行为可以在设置里选：最小化到托盘，或退出并清理。Linux 上托盘图标的单击事件经常不会到来，所以“显示窗口”是菜单项，不依赖左键。若托盘创建失败，关闭窗口会直接退出并清理，避免窗口被藏起来以后找不到。
+关闭按钮的行为可以在设置里选：最小化到托盘，或退出并清理。只有在托盘对象创建成功，并且会话总线上有 `org.kde.StatusNotifierWatcher` 时，关闭才会隐藏窗口。没有这个宿主时，即使设置选了最小化，关闭也会断开并退出，避免窗口被藏起来以后找不到。Linux 上托盘图标的单击事件经常不会到来，所以“显示窗口”是菜单项，不依赖左键。
+
+本机面板没有出现可点击的托盘图标，托盘菜单没有被交互验证。设置页会写明当前环境没有可用托盘。
 
 ## 本机测试结果
 
-命令都在这台 Linux 虚拟机上执行。日期 2026-11-06。工具链：rustc 1.99.1，Node v22.23.4，OpenSSH 9.6p1，Tauri 2。
+命令都在这台 Linux 虚拟机上执行。日期 2026-11-06。工具链：rustc 1.99.1，Node v22.23.4，OpenSSH 9.6p1，Tauri 2，russh 0.65。没有使用用户的 Mac、GCE 或真实 SSH。
 
 | 命令 | 结果 |
 | --- | --- |
-| `cd src-tauri && cargo fmt --all -- --check` | 通过 |
-| `cd src-tauri && cargo test` | 通过。库测试 25 项，主程序 0 项，文档测试 0 项。耗时约 0.27 秒 |
+| `cd src-tauri && cargo fmt --all` | 已格式化 |
+| `cd src-tauri && cargo test --offline --lib` | 通过。36 项，约 11.2 秒。未设置钥匙串环境变量，实机钥匙串测试在其中直接返回 |
 | `npm run lint` | 通过（eslint，0 warning） |
 | `npm run typecheck` | 通过（tsc --noEmit） |
 | `npm test` | 通过。Vitest 4 项 |
 | `npm run build` | 通过。Vite 8 生产构建成功，有一条大于 500 kB 的包体积警告 |
+| `CARGO_BUILD_JOBS=1 bash scripts/package-linux.sh` | 通过。`TunnelDesk_0.1.0_amd64.deb` 3,273,362 字节，二进制 7,322,232 字节。release 编译约 1 分 15 秒。未签名 |
 
-25 项 Rust 测试覆盖：配置别名与先值获胜、通配符不当成主机、有 `ssh` 时对照 `ssh -G`、本地/远程校验、对外监听必须显式允许、注入与端口、`ssh -G` 参数不含秘密、连接阶段必须等全部转发成功、IPv6 回环、known_hosts 的端口与哈希与吊销、证书权威行不信任普通公钥、模型拒绝密码字段、历史与设置不含秘密、钥匙串失败不写明文文件、跳板解析拒绝注入、跳板环检测。
+另有一次在一次性 `dbus-run-session` + 已解锁 `gnome-keyring` 里、`TUNNELDESK_KEYRING_TEST=1` 的 `os_keyring_password_authenticates_and_forget_deletes_it`，通过，约 0.33 秒。它走应用自己的保存、读取、认证、忘记路径，密码不在命令行里。
 
-集成测试在临时目录里起一个 russh 测试服务器，不读取真实的 `~/.ssh`，也不打印测试口令：
+对临时 OpenSSH `sshd`（`/usr/sbin/sshd -f` 指向临时配置，不改系统 sshd）的测试：
 
-- 本地转发和远程转发都能把字节送到回显服务，断开后两个监听端口都可以再次绑定。`known_hosts` 保持为空，JSON 里没有口令。信任之后可以用钥匙串替身里的口令重连，不再弹出主机确认。
-- 预先写入不同的主机密钥时拒绝，且不会询问信任。拒绝未知密钥、错误口令、本机端口占用、服务器拒绝远程转发，都会断开且不留下监听。失败的“记住密码”不会把口令写进数据目录。
+- 密码认证的 `-L` 和 `-R` 都能把字节送到回显服务。`Include` 里更具体的 `Host` 写在 `Host *` 前面，`ssh -G` 的解析和实际 TCP 连接使用的是同一个用户和端口。断开后两个监听端口都可以再次绑定。JSON 里没有口令。记住密码后可以不再输入并重连，忘记之后下一次要求密码。
+- 未知主机要确认。`ssh-keygen -H` 之后的哈希 `known_hosts` 可以信任且不再询问。`@revoked` 拒绝。换成另一把密钥拒绝。
+- 连一个没人听的端口不会留下监听。两条本地转发里有一条端口被占用时返回 `port_in_use` 并释放另一条。`AllowTcpForwarding local` 时远程转发被拒绝，本地监听也被释放。
+- 会话建立之后杀掉 sshd，状态变为失败，本地端口释放，历史结果是 `failed`。
+- 加密的 ed25519 只接受私钥口令，不接受把口令当成服务器密码。只有服务器密码、没有口令时，公钥模式返回 `passphrase_required`，sshd 日志里没有 `Accepted password`。
+- `ProxyJump` 的跳板日志是 `Accepted publickey`，没有 `Accepted password`。`ProxyCommand` 会真正执行并留下标记文件。
+- 目标端口拒绝时（OpenSSH 对 `direct-tcpip` 回 channel-open 失败），会话保持已连接，另一条转发仍能传数据。
 
-钥匙串实机：
+russh 测试服务器仍覆盖：双向数据、断开释放端口、错误口令、变化的主机密钥、端口占用、服务器拒绝转发。它和 OpenSSH 不是同一个实现，不能互相代替。
 
-- 未设置 `TUNNELDESK_KEYRING_TEST=1` 时，实机钥匙串测试直接返回，不接触钥匙串。上面的 `cargo test` 就是这条路径。
-- 桌面会话没有可用的用户 D-Bus（`DBUS_SESSION_BUS_ADDRESS=autolaunch:`，没有 `/run/user/1000/bus`）。正在运行的应用在设置页显示钥匙串不可用，并写明不会保存明文。截图与此一致。
-- 在独立的 `dbus-run-session` 里启动 `gnome-keyring-daemon` 后，状态能变为已锁定而不是超时。写入被拒绝，错误码 `keyring_locked`，耗时约 0.04 秒。创建默认密码库会弹出系统提示，而 `gcr-prompter` 连不上这个临时会话总线，因此**没能完成一次真实的存、读、删往返**。这是这台虚拟机的限制，不是改走明文的理由。
-
-原生窗口在本机 Xvfb（`DISPLAY=:1`）里打开过。截图是真实 WebKit 窗口，不是浏览器预览。托盘图标窗口已创建，但面板里没有状态图标宿主，托盘菜单没有截到。不要把托盘菜单当成已经肉眼验证。
+原生窗口在本机 X 显示（`DISPLAY=:1`）里打开过。截图是真实 WebKit 窗口。其中「已连接」来自对临时 sshd 的密码认证，sshd 日志有 `Accepted password`，两条监听都处于 listening。目标端口 9 拒绝之后，监听仍然接受新连接，会话没有被拆掉。界面上的主机名是合成夹具。密码没有出现在截图或日志说明里。桌面会话本身没有可用的 Secret Service，所以这次图形界面连接没有勾选记住密码；记住密码的往返是上面的一次性钥匙串测试，不是这张截图。
 
 ## 平台
 
-| 平台 | 本仓库里实际发生的事 |
+代码按这些平台编写（尚未在该系统上构建或运行的，不能写成已验证）：
+
+| 平台 | 代码里准备了什么 |
 | --- | --- |
-| Linux x86_64 | 编译、25 项 Rust 测试、前端检查、L/R 集成测试、原生窗口截图。已打出未签名的 `TunnelDesk_0.1.0_amd64.deb`（3,267,180 字节，release 配置，链接约 6 分 45 秒）。 |
-| macOS | 未构建，未签名，未公证。代码路径包含 Keychain 和 `.ssh/config`。 |
-| Windows | 未构建，未签名。代码路径包含凭据管理器和 `%USERPROFILE%\.ssh\config`。SSH agent 只在 Unix 上连接。 |
+| Linux x86_64 | deb 包、Secret Service、Ayatana 托盘、WebKitGTK |
+| macOS | `app` / `dmg` 目标、Keychain、`~/.ssh/config` |
+| Windows | `nsis` / `msi` 目标、Credential Manager、`%USERPROFILE%\.ssh\config` |
+
+这台虚拟机实际验证过的：
+
+| 平台 | 实际发生的事 |
+| --- | --- |
+| Linux x86_64 | 编译、36 项 Rust 测试、前端检查、russh 集成测试、临时 OpenSSH 的 L/R、主机密钥、跳板、口令与密码区分、会话丢失、一次性钥匙串往返、原生窗口截图、关闭窗口会退出并释放端口。已打出未签名的 `TunnelDesk_0.1.0_amd64.deb`（3,273,362 字节，二进制 7,322,232 字节）。 |
+| macOS | 未构建，未签名，未公证。 |
+| Windows | 未构建，未签名。SSH agent 只在 Unix 上连接。 |
 
 ## 已知限制
 
 - 不支持 GSSAPI、PKCS#11、SSH 证书、`ProxyUseFdpass`、agent 转发。
 - 跳板不用目标主机的密码。
 - 配置文件里的 `LocalForward` / `RemoteForward` 不会自动套用。
-- 没有用户会话总线或钥匙串已锁定时，不能记住密码。
-- Linux 托盘依赖 Ayatana AppIndicator。没有托盘时关闭即退出。
+- 没有用户会话总线或钥匙串已锁定时，不能记住密码。普通桌面会话若没有已解锁的 Secret Service，设置页会显示钥匙串不可用。
+- 本机没有可点击的托盘宿主（会话总线上没有 `org.kde.StatusNotifierWatcher`）。托盘菜单的显示、隐藏、恢复和退出没有被点击验证。没有宿主时关闭窗口会退出并清理。
 - 不修改服务器的 `GatewayPorts`。远程转发默认只出现在服务器的回环地址上。
 - 未做自动更新、多用户和同步。
+- Windows 和 macOS 没有在对应机器上编译。列出的打包目标和工作流模板都不是已通过的原生构建。

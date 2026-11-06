@@ -12,6 +12,9 @@ pub mod tunnel;
 #[cfg(test)]
 mod ssh_itest;
 
+#[cfg(all(test, unix))]
+mod sshd_itest;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,7 +81,13 @@ pub fn run() {
                 prompts,
                 tray_available: tray_available.clone(),
             });
-            let installed = tray::install(app.handle());
+            let mut installed = tray::install(app.handle());
+            // A tray object without a panel host cannot be clicked. Treat that as
+            // no tray so closing the window quits instead of hiding it.
+            #[cfg(target_os = "linux")]
+            if installed && !tray::status_notifier_watcher_present() {
+                installed = false;
+            }
             tray_available.store(installed, Ordering::SeqCst);
             let settings = manager.store().load_settings().unwrap_or_default();
             if settings.start_minimized && installed {

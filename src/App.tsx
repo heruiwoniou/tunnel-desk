@@ -265,7 +265,7 @@ export default function App() {
             <TabsTrigger value="settings">{zh ? "设置" : "Settings"}</TabsTrigger>
           </TabsList>
         </div>
-        <TabsContent value="tunnels" className="min-h-0 flex-1 px-4 pb-4">
+        <TabsContent value="tunnels" className="flex min-h-0 flex-1 flex-col px-4 pb-4">
           {loading ? (
             <div className="flex flex-col gap-3">
               <Skeleton className="h-16 w-full" />
@@ -282,8 +282,8 @@ export default function App() {
               </AlertDescription>
             </Alert>
           ) : (
-            <div className="grid min-h-0 gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
-              <div className="flex min-h-0 flex-col gap-3">
+            <div className="grid min-h-0 flex-1 items-start gap-3 md:grid-cols-[minmax(15rem,18rem)_minmax(0,1fr)]">
+              <div className="flex min-h-0 flex-col gap-2">
                 <Button onClick={() => setEditor("new")}>
                   <PlusIcon data-icon="inline-start" />
                   {zh ? "新建隧道" : "New tunnel"}
@@ -296,7 +296,9 @@ export default function App() {
                       </EmptyMedia>
                       <EmptyTitle>{zh ? "还没有隧道" : "No tunnels yet"}</EmptyTitle>
                       <EmptyDescription>
-                        {zh ? "从 SSH 配置选一个别名，或手动填写主机。" : "Pick an alias from your SSH config, or enter a host manually."}
+                        {zh
+                          ? "从主机页选一个 SSH 别名，或手动填写地址。规则保存在本机，密码只进系统钥匙串。"
+                          : "Pick an SSH alias from Hosts, or enter an address. Rules stay on this computer; passwords go only to the OS keyring."}
                       </EmptyDescription>
                     </EmptyHeader>
                     <EmptyContent>
@@ -306,8 +308,8 @@ export default function App() {
                     </EmptyContent>
                   </Empty>
                 ) : (
-                  <ScrollArea className="h-[calc(100svh-180px)]">
-                    <div className="flex flex-col gap-2 pr-3">
+                  <ScrollArea className="min-h-0 flex-1 md:max-h-[calc(100svh-11rem)]">
+                    <div className="flex flex-col gap-1.5 pr-3">
                       {profiles.map((profile) => {
                         const itemPhase = snapshots.find((item) => item.profileId === profile.id)?.phase ?? "disconnected"
                         return (
@@ -315,12 +317,14 @@ export default function App() {
                             key={profile.id}
                             type="button"
                             onClick={() => setSelectedId(profile.id)}
-                            className={`flex flex-col items-start gap-1 rounded-lg border px-3 py-2 text-left focus-visible:ring-3 focus-visible:ring-ring/50 ${
+                            className={`flex items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left focus-visible:ring-3 focus-visible:ring-ring/50 ${
                               profile.id === selectedId ? "bg-muted" : "bg-card"
                             }`}
                           >
-                            <span className="font-medium">{profile.name}</span>
-                            <span className="truncate text-xs text-muted-foreground">{targetLabel(profile)}</span>
+                            <span className="flex min-w-0 flex-col gap-0.5">
+                              <span className="truncate text-sm font-medium">{profile.name}</span>
+                              <span className="truncate text-xs text-muted-foreground">{targetLabel(profile)}</span>
+                            </span>
                             <PhaseBadge phase={itemPhase} language={settings.language} />
                           </button>
                         )
@@ -329,7 +333,7 @@ export default function App() {
                   </ScrollArea>
                 )}
               </div>
-              <Card className="min-w-0">
+              <Card className="min-h-0 min-w-0">
                 {selected ? (
                   <>
                     <CardHeader>
@@ -339,42 +343,42 @@ export default function App() {
                       </CardTitle>
                       <CardDescription>{targetLabel(selected)}</CardDescription>
                     </CardHeader>
-                    <CardContent className="flex flex-col gap-4">
+                    <CardContent className="flex flex-col gap-3">
                       {snapshot?.message ? <p className="text-sm text-muted-foreground">{snapshot.message}</p> : null}
-                      <Table>
-                        <TableHeader>
-                          <TableRow>
-                            <TableHead>{zh ? "方向" : "Direction"}</TableHead>
-                            <TableHead>{zh ? "监听" : "Listen"}</TableHead>
-                            <TableHead>{zh ? "目标" : "Destination"}</TableHead>
-                            <TableHead>{zh ? "状态" : "State"}</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          {selected.forwards.map((forward) => {
-                            const live = snapshot?.forwards.find((item) => item.id === forward.id)
-                            return (
-                              <TableRow key={forward.id}>
-                                <TableCell>
-                                  <div className="flex flex-col gap-1">
-                                    <span>{directionLabel(forward.direction, settings.language)}</span>
-                                    <span className="text-xs text-muted-foreground">
-                                      {directionHelp(forward.direction, settings.language)}
-                                    </span>
-                                  </div>
-                                </TableCell>
-                                <TableCell>
-                                  {forward.listenHost}:{forward.listenPort}
-                                </TableCell>
-                                <TableCell>
-                                  {forward.destinationHost}:{forward.destinationPort}
-                                </TableCell>
-                                <TableCell>{live?.state ?? (zh ? "未启动" : "Stopped")}</TableCell>
-                              </TableRow>
-                            )
-                          })}
-                        </TableBody>
-                      </Table>
+                      <div className="flex flex-col gap-3">
+                        {selected.forwards.map((forward, index) => {
+                          const live = snapshot?.forwards.find((item) => item.id === forward.id)
+                          return (
+                            <div key={forward.id} className="flex flex-col gap-2">
+                              {index > 0 ? <Separator /> : null}
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge variant="outline">{directionLabel(forward.direction, settings.language)}</Badge>
+                                <span className="text-xs text-muted-foreground">{directionHelp(forward.direction, settings.language)}</span>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <div className="flex flex-col gap-0.5">
+                                  <span className="text-xs text-muted-foreground">{zh ? "监听" : "Listen"}</span>
+                                  <span className="font-medium tabular-nums">
+                                    {forward.listenHost}:{forward.listenPort}
+                                  </span>
+                                </div>
+                                <div className="flex flex-col gap-0.5">
+                                  <span className="text-xs text-muted-foreground">{zh ? "目标" : "Destination"}</span>
+                                  <span className="font-medium tabular-nums">
+                                    {forward.destinationHost}:{forward.destinationPort}
+                                  </span>
+                                </div>
+                              </div>
+                              <span className="text-xs text-muted-foreground">
+                                {zh ? "状态" : "State"}
+                                {" · "}
+                                {live?.state ?? (zh ? "未启动" : "Stopped")}
+                                {live?.message ? ` · ${live.message}` : ""}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
                       {meta ? (
                         <p className="text-sm text-muted-foreground">
                           {zh ? "已保存的服务器密码：" : "Saved server password: "}

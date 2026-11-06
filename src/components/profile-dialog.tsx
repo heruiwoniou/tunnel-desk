@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/dialog"
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
@@ -93,7 +94,7 @@ export function ProfileDialog({
         onOpenChange(next)
       }}
     >
-      <DialogContent className="max-h-[86vh] overflow-y-auto sm:max-w-2xl">
+      <DialogContent className="flex h-[min(92svh,40rem)] max-h-[92svh] flex-col gap-4 overflow-hidden sm:max-w-xl">
         <DialogHeader>
           <DialogTitle>{initial ? (zh ? "编辑隧道" : "Edit tunnel") : zh ? "新建隧道" : "New tunnel"}</DialogTitle>
           <DialogDescription>
@@ -102,6 +103,7 @@ export function ProfileDialog({
               : "The rule stays on this computer. Passwords and key passphrases are not stored in it."}
           </DialogDescription>
         </DialogHeader>
+        <ScrollArea className="min-h-0 flex-1">
         <FieldGroup>
           <Field>
             <FieldLabel htmlFor="tunnel-name">{zh ? "名称" : "Name"}</FieldLabel>
@@ -381,6 +383,7 @@ export function ProfileDialog({
             </Alert>
           ) : null}
         </FieldGroup>
+        </ScrollArea>
         <DialogFooter>
           <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
             {zh ? "取消" : "Cancel"}

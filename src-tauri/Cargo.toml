@@ -20,7 +20,10 @@ serde_json = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "fs"] }
 russh = "0.65"
-keyring = { version = "4", features = ["v1"] }
+# v1 is the OS credential store for the compiled target: macOS Keychain,
+# Windows Credential Manager, Linux Secret Service. Those crates are
+# cfg-gated inside keyring. Do not enable db-keystore or linux-keyutils.
+keyring = { version = "4", default-features = false, features = ["v1"] }
 zeroize = "1"
 hmac = "0.12"
 sha1 = "0.10"

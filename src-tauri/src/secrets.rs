@@ -4,7 +4,8 @@ use crate::error::AppError;
 
 pub use zeroize::Zeroizing as SecretString;
 
-const SERVICE: &str = "dev.tunneldesk.app";
+/// Must match `identifier` in `tauri.conf.json`. Not a secret.
+pub const SERVICE: &str = "dev.tunneldesk.desktop";
 
 #[derive(Debug, Clone)]
 pub struct SecretBackendStatus {
@@ -266,8 +267,20 @@ mod tests {
         let secret = format!("td-{}", uuid::Uuid::new_v4());
         store.set(&account, &secret).unwrap();
         let got = store.get(&account).unwrap().unwrap();
-        assert_eq!(got.as_str(), secret.as_str());
+        assert!(
+            got.as_str() == secret.as_str(),
+            "keyring round trip mismatch"
+        );
         store.delete(&account).unwrap();
         assert!(store.get(&account).unwrap().is_none());
+    }
+
+    #[test]
+    fn service_name_matches_the_bundle_identifier() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["identifier"], SERVICE);
+        assert!(!SERVICE.ends_with(".app"));
+        assert!(!SERVICE.contains('/'));
     }
 }
