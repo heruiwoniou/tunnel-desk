@@ -127,6 +127,16 @@ pub fn run() {
         .expect("error while running TunnelDesk");
 }
 
+#[cfg(test)]
+mod version_source {
+    #[test]
+    fn cargo_package_version_matches_tauri_config() {
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    }
+}
+
 fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, AppError> {
     if let Some(dir) = std::env::var_os("TUNNELDESK_DATA_DIR") {
         return Ok(PathBuf::from(dir));

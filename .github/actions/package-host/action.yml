@@ -1,0 +1,112 @@
+name: Package TunnelDesk
+description: Build one platform installer and upload it as a workflow artifact.
+inputs:
+  rust-target:
+    description: Rust target triple passed to tauri build.
+    required: true
+  platform:
+    description: Asset platform id such as linux-amd64, windows-x64, macos-aarch64, or macos-x64.
+    required: true
+  bundles:
+    description: Tauri bundle list, or auto to choose Windows bundles from the version.
+    required: true
+  cargo-test:
+    description: Run cargo test before packaging when true.
+    required: false
+    default: "false"
+  apple-adhoc:
+    description: Set the Tauri ad-hoc macOS signing identity when true.
+    required: false
+    default: "false"
+  upload:
+    description: Upload the named installers when true.
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Setup toolchain
+      uses: ./.github/actions/setup
+      with:
+        rust-target: ${{ inputs.rust-target }}
+
+    - name: Rust tests
+      if: inputs.cargo-test == 'true'
+      shell: bash
+      working-directory: src-tauri
+      run: cargo test --locked
+
+    - name: Resolve bundle list
+      id: bundles
+      shell: bash
+      env:
+        BUNDLES: ${{ inputs.bundles }}
+      run: |
+        set -euo pipefail
+        bundles="${BUNDLES}"
+        if [[ "${bundles}" == "auto" ]]; then
+          bundles="$(node scripts/version.mjs windows-bundles)"
+        fi
+        case "${bundles}" in
+          deb | dmg | nsis | nsis,msi) ;;
+          *)
+            echo "unsupported bundle list: ${bundles}" >&2
+            exit 1
+            ;;
+        esac
+        echo "list=${bundles}" >> "${GITHUB_OUTPUT}"
+        if [[ "${bundles}" == *msi* ]]; then
+          echo "msi=true" >> "${GITHUB_OUTPUT}"
+        else
+          echo "msi=false" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Ensure VBScript for WiX
+      if: runner.os == 'Windows' && steps.bundles.outputs.msi == 'true'
+      shell: pwsh
+      run: |
+        $caps = @(Get-WindowsCapability -Online | Where-Object { $_.Name -like "VBSCRIPT*" })
+        if ($caps.Count -eq 0) {
+          Write-Host "No VBSCRIPT Windows capability is listed on this image. Continuing."
+          exit 0
+        }
+        foreach ($cap in $caps) {
+          Write-Host "$($cap.Name) $($cap.State)"
+          if ($cap.State -ne "Installed") {
+            Add-WindowsCapability -Online -Name $cap.Name
+          }
+        }
+
+    - name: Build installer
+      shell: bash
+      env:
+        APPLE_SIGNING_IDENTITY: ${{ inputs.apple-adhoc == 'true' && '-' || '' }}
+        BUNDLE_LIST: ${{ steps.bundles.outputs.list }}
+        RUST_TARGET: ${{ inputs.rust-target }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${APPLE_SIGNING_IDENTITY}" ]]; then
+          unset APPLE_SIGNING_IDENTITY
+        fi
+        npm run tauri build -- --ci --bundles "${BUNDLE_LIST}" --target "${RUST_TARGET}" -- --locked
+
+    - name: Name installers
+      shell: bash
+      env:
+        PLATFORM: ${{ inputs.platform }}
+        RUST_TARGET: ${{ inputs.rust-target }}
+      run: |
+        set -euo pipefail
+        node scripts/version.mjs collect \
+          --platform "${PLATFORM}" \
+          --target "${RUST_TARGET}" \
+          --output release-assets
+
+    - name: Upload installers
+      if: inputs.upload == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: tunneldesk-${{ inputs.platform }}
+        path: release-assets/*
+        if-no-files-found: error
+        retention-days: 14
