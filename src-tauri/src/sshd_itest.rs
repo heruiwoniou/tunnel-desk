@@ -1638,3 +1638,340 @@ async fn openssh_parallel_connect_is_rejected() {
     let _ = first.await;
     manager.disconnect_all().await.unwrap();
 }
+
+struct StallPrompter {
+    reached: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl HostKeyPrompter for StallPrompter {
+    async fn confirm_unknown(&self, _: &HostKeyPrompt) -> bool {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        false
+    }
+}
+
+#[tokio::test]
+async fn openssh_cancel_during_host_key_prompt() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    let item = profile(
+        "cancel-host",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stall = Arc::new(StallPrompter {
+        reached: Arc::clone(&reached),
+    });
+    let mgr = Arc::clone(&manager);
+    let join = tokio::spawn(async move {
+        mgr.connect(
+            "cancel-host",
+            Some(Zeroizing::new(server.password.clone())),
+            None,
+            false,
+            false,
+            stall,
+        )
+        .await
+    });
+    for _ in 0..100 {
+        if reached.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    manager.cancel_connect("cancel-host").await.unwrap();
+    let outcome = join.await.expect("join");
+    assert!(matches!(outcome, Err(err) if err.code == "cancelled"));
+    assert!(manager.snapshots().is_empty());
+}
+
+#[tokio::test]
+async fn openssh_runtime_forward_persist_load_and_save_bounds() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let listen = free_port();
+    let added = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    connect_alias(
+        &manager,
+        "persist-tx",
+        vec![mapping(Direction::Local, listen, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let profiles_path = dir.path().join("profiles.json");
+    let good = std::fs::read(&profiles_path).unwrap();
+    std::fs::write(&profiles_path, b"{").unwrap();
+    let broken = manager
+        .add_runtime_forward(
+            "persist-tx",
+            &mapping(Direction::Local, added, echo.port()),
+            true,
+        )
+        .await
+        .expect_err("load should fail before runtime mutation");
+    assert_eq!(broken.code, "config");
+    assert_eq!(manager.snapshots()[0].forwards.len(), 1);
+
+    std::fs::write(&profiles_path, &good).unwrap();
+    let extra = mapping(Direction::Local, added, echo.port());
+    manager.store().inject_profile_save_failure(true);
+    let save_fail = manager
+        .add_runtime_forward("persist-tx", &extra, true)
+        .await
+        .expect_err("save blocked");
+    assert_eq!(save_fail.code, "config");
+    assert_eq!(save_fail.runtime_applied, Some(false));
+    assert_eq!(save_fail.persist_applied, Some(false));
+    let dead = exchange_once(SocketAddr::from(([127, 0, 0, 1], added)), b"x").await;
+    assert!(dead.is_err(), "runtime forward should be rolled back");
+    manager
+        .add_runtime_forward("persist-tx", &extra, true)
+        .await
+        .expect("forward restored on disk");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    manager.store().inject_profile_save_failure(true);
+    let remove_err = manager
+        .remove_runtime_forward("persist-tx", &extra.id, true)
+        .await
+        .expect_err("remove save blocked");
+    assert!(
+        remove_err.code == "persist_failed" || remove_err.code == "persist_compensate_failed",
+        "{}",
+        remove_err.message
+    );
+    if remove_err.code == "persist_failed" {
+        assert_eq!(remove_err.persist_applied, Some(false));
+        assert_eq!(remove_err.runtime_applied, Some(true));
+        assert!(
+            manager
+                .snapshots()[0]
+                .forwards
+                .iter()
+                .any(|item| item.id == extra.id),
+            "runtime mapping should be restored after save failure"
+        );
+        exchange(SocketAddr::from(([127, 0, 0, 1], added)), b"still-live").await;
+    } else {
+        assert_eq!(remove_err.runtime_applied, Some(false));
+        assert_eq!(remove_err.persist_applied, Some(true));
+    }
+    manager.disconnect("persist-tx").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_concurrent_runtime_forward_ids_do_not_orphan() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let listen = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    connect_alias(
+        &manager,
+        "race",
+        vec![mapping(Direction::Local, listen, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let a = mapping(Direction::Local, free_port(), echo.port());
+    let mut b = a.clone();
+    b.listen_port = free_port();
+    let mgr = Arc::clone(&manager);
+    let (left, right) = tokio::join!(
+        mgr.add_runtime_forward("race", &a, false),
+        manager.add_runtime_forward("race", &b, false),
+    );
+    let outcomes = [left, right];
+    let wins = outcomes.iter().filter(|item| item.is_ok()).count();
+    let dupes = outcomes
+        .iter()
+        .filter(|item| matches!(item, Err(err) if err.code == "forward_exists"))
+        .count();
+    assert_eq!(wins, 1);
+    assert_eq!(dupes, 1);
+    assert_eq!(manager.snapshots()[0].forwards.len(), 2);
+    manager.disconnect("race").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_wrong_passphrase_vs_rejected_pubkey() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", true, false, None);
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("id_ed25519");
+    let passphrase = format!("pp-{}", token());
+    let status = Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-f",
+            key.to_str().unwrap(),
+            "-N",
+            &passphrase,
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let known = dir.path().join("known_hosts");
+    std::fs::write(&known, b"").unwrap();
+    std::fs::write(
+        dir.path().join("extra"),
+        format!(
+            "\
+Host db
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  IdentitiesOnly yes
+  IdentityAgent none
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+",
+            port = server.port,
+            user = server.user,
+            key = key.display(),
+            known = known.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    let listen = free_port();
+    let echo = echo_server().await;
+    let item = profile(
+        "pubkey",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::PublicKey,
+        vec![mapping(Direction::Local, listen, echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let missing = manager
+        .connect(
+            "pubkey",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("encrypted key needs passphrase");
+    assert_eq!(missing.code, "passphrase_required");
+    let wrong = manager
+        .connect(
+            "pubkey",
+            None,
+            Some(Zeroizing::new("not-the-passphrase".into())),
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("bad decrypt");
+    assert_eq!(wrong.code, "passphrase_rejected");
+    let rejected = manager
+        .connect(
+            "pubkey",
+            None,
+            Some(Zeroizing::new(passphrase)),
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("key not authorized");
+    assert_eq!(rejected.code, "auth_failed");
+    assert_ne!(rejected.code, "passphrase_rejected");
+    manager.disconnect_all().await.unwrap();
+}

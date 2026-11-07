@@ -99,6 +99,7 @@ struct TestServer {
     user: String,
     password: String,
     refuse_forward: bool,
+    refuse_cancel_forward: bool,
     forwards: Arc<Mutex<std::collections::HashMap<u16, CancellationToken>>>,
 }
 
@@ -206,6 +207,9 @@ impl Handler for TestServer {
         port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        if self.refuse_cancel_forward {
+            return Ok(false);
+        }
         if let Ok(port) = u16::try_from(port)
             && let Some(token) = self.forwards.lock().expect("forwards").remove(&port)
         {
@@ -335,6 +339,14 @@ async fn echo_server() -> SocketAddr {
 }
 
 async fn ssh_server(password: String, refuse_forward: bool) -> SocketAddr {
+    ssh_server_opts(password, refuse_forward, false).await
+}
+
+async fn ssh_server_opts(
+    password: String,
+    refuse_forward: bool,
+    refuse_cancel_forward: bool,
+) -> SocketAddr {
     let mut config = russh::server::Config::default();
     config.auth_rejection_time = Duration::from_millis(1);
     config.auth_rejection_time_initial = Some(Duration::from_millis(1));
@@ -353,6 +365,7 @@ async fn ssh_server(password: String, refuse_forward: bool) -> SocketAddr {
         user: "tdtest".into(),
         password,
         refuse_forward,
+        refuse_cancel_forward,
         forwards: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     tokio::spawn(async move {
@@ -611,4 +624,53 @@ async fn rejects_bad_password_changed_key_occupied_port_and_forward_refusal() {
     .await;
     assert_eq!(denied.unwrap_err().code, "forward_denied");
     assert_no_secret(dir.path(), &secret);
+}
+
+#[tokio::test]
+async fn remote_forward_remove_reports_cancel_failure_and_keeps_mapping() {
+    let secret = fake_secret();
+    let echo = echo_server().await;
+    let ssh = ssh_server_opts(secret.clone(), false, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    );
+    let remote_port = free_port();
+    let item = profile(
+        "remote-cancel",
+        ssh.port(),
+        vec![mapping(Direction::Remote, remote_port, echo.port())],
+        false,
+    );
+    save_and_connect(
+        &manager,
+        &item,
+        Some(&secret),
+        false,
+        Arc::new(FixedPrompter(true)),
+    )
+    .await
+    .expect("connect");
+    exchange(
+        SocketAddr::from(([127, 0, 0, 1], remote_port)),
+        b"remote-before",
+    )
+    .await;
+    let forward_id = manager.snapshots()[0].forwards[0].id.clone();
+    let err = manager
+        .remove_runtime_forward("remote-cancel", &forward_id, false)
+        .await
+        .expect_err("server refused cancel");
+    assert_eq!(err.code, "forward_cancel_failed");
+    assert_eq!(manager.snapshots()[0].forwards.len(), 1);
+    exchange(
+        SocketAddr::from(([127, 0, 0, 1], remote_port)),
+        b"remote-still",
+    )
+    .await;
+    manager.disconnect("remote-cancel").await.unwrap();
 }

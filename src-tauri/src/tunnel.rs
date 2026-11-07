@@ -72,6 +72,7 @@ pub struct Endpoint {
     pub proxy_command: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct SessionSpec {
     pub profile_id: String,
     pub name: String,
@@ -80,6 +81,71 @@ pub struct SessionSpec {
     pub forwards: Vec<ValidatedForward>,
     pub password: Option<Zeroizing<String>>,
     pub passphrase: Option<Zeroizing<String>>,
+    pub passphrases_by_host: HashMap<String, Zeroizing<String>>,
+}
+
+impl SessionSpec {
+    fn passphrase_for(&self, endpoint: &Endpoint) -> Option<&Zeroizing<String>> {
+        self.passphrases_by_host
+            .get(&endpoint.host)
+            .or(self.passphrase.as_ref())
+    }
+
+    fn merge_passphrase(&mut self, host: &str, value: Zeroizing<String>) {
+        self.passphrases_by_host
+            .insert(host.to_string(), value.clone());
+        if self.hops.last().is_some_and(|hop| hop.host == host) {
+            self.passphrase = Some(value);
+        }
+    }
+}
+
+struct PendingAuth {
+    spec: SessionSpec,
+    hops: Vec<Endpoint>,
+    hop_index: usize,
+    kept: Mutex<Vec<client::Handle<ClientHandler>>>,
+    proxies: Mutex<Vec<tokio::process::Child>>,
+    pending: Mutex<Option<client::Handle<ClientHandler>>>,
+    trust: Arc<Mutex<TrustStore>>,
+    trust_path: PathBuf,
+    snapshot: Arc<Mutex<TunnelSnapshot>>,
+    remote_rules: Arc<Mutex<Vec<RemoteRule>>>,
+    cancel: CancellationToken,
+}
+
+struct SessionFailure {
+    error: AppError,
+    resume: Option<PendingAuth>,
+}
+
+impl From<AppError> for SessionFailure {
+    fn from(error: AppError) -> Self {
+        Self {
+            error,
+            resume: None,
+        }
+    }
+}
+
+async fn teardown_hops(
+    kept: Vec<client::Handle<ClientHandler>>,
+    proxies: Vec<tokio::process::Child>,
+) {
+    for hop in kept {
+        let _ = hop.disconnect(Disconnect::ByApplication, "", "en").await;
+    }
+    drop(proxies);
+}
+
+async fn teardown_pending(pending: PendingAuth) {
+    let handle = pending.pending.lock().expect("pending").take();
+    if let Some(handle) = handle {
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+    }
+    let kept = std::mem::take(&mut *pending.kept.lock().expect("kept"));
+    let proxies = std::mem::take(&mut *pending.proxies.lock().expect("proxies"));
+    teardown_hops(kept, proxies).await;
 }
 
 impl std::fmt::Debug for SessionSpec {
@@ -139,6 +205,7 @@ pub struct TunnelManager {
     resolver: Resolver,
     running: Arc<Mutex<HashMap<String, Running>>>,
     inflight: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pending_auth: Arc<Mutex<HashMap<String, PendingAuth>>>,
     watch: watch::Sender<Vec<TunnelSnapshot>>,
 }
 
@@ -151,6 +218,7 @@ impl TunnelManager {
             resolver,
             running: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashMap::new())),
+            pending_auth: Arc::new(Mutex::new(HashMap::new())),
             watch,
         }
     }
@@ -184,6 +252,28 @@ impl TunnelManager {
         passphrase: Option<Zeroizing<String>>,
         remember_password: bool,
         remember_passphrase: bool,
+        prompter: Arc<dyn HostKeyPrompter>,
+    ) -> Result<ConnectOutcome, AppError> {
+        self.connect_with_challenge(
+            profile_id,
+            password,
+            passphrase,
+            remember_password,
+            remember_passphrase,
+            None,
+            prompter,
+        )
+        .await
+    }
+
+    pub async fn connect_with_challenge(
+        &self,
+        profile_id: &str,
+        password: Option<Zeroizing<String>>,
+        passphrase: Option<Zeroizing<String>>,
+        remember_password: bool,
+        remember_passphrase: bool,
+        challenge_host: Option<String>,
         prompter: Arc<dyn HostKeyPrompter>,
     ) -> Result<ConnectOutcome, AppError> {
         if self
@@ -226,7 +316,10 @@ impl TunnelManager {
         let password = self.load_password(&profile, password, remember_password, &mut warnings)?;
         let passphrase =
             self.load_passphrase(&profile, passphrase, remember_passphrase, &mut warnings)?;
-        let spec = self.spec_for_profile(&profile, password, passphrase)?;
+        let mut spec = self.spec_for_profile(&profile, password.clone(), passphrase.clone())?;
+        if let (Some(host), Some(phrase)) = (challenge_host.as_ref(), typed_passphrase.as_ref()) {
+            spec.merge_passphrase(host, phrase.clone());
+        }
         let secret_view = secret_view(&spec);
         let trust = Arc::new(Mutex::new(self.store.load_trust()?));
         let connect_cancel = CancellationToken::new();
@@ -234,20 +327,43 @@ impl TunnelManager {
             .lock()
             .expect("inflight")
             .insert(profile_id.to_string(), connect_cancel.clone());
-        let result = start_session(
-            spec,
-            prompter,
-            self.store.trust_path(),
-            trust.clone(),
-            connect_cancel,
-        )
-        .await;
+        let pending_resume = self
+            .pending_auth
+            .lock()
+            .expect("pending")
+            .remove(profile_id);
+        let result = if let Some(mut pending) = pending_resume {
+            if let Some(value) = spec.password.clone() {
+                pending.spec.password = Some(value);
+            }
+            if let Some(phrase) = spec.passphrase.clone() {
+                if let Some(host) = challenge_host.as_deref() {
+                    pending.spec.merge_passphrase(host, phrase);
+                } else if let Some(hop) = pending.hops.get(pending.hop_index) {
+                    pending.spec.merge_passphrase(&hop.host, phrase);
+                }
+            }
+            continue_pending_session(pending, prompter, connect_cancel).await
+        } else {
+            start_session(
+                spec,
+                prompter,
+                self.store.trust_path(),
+                trust.clone(),
+                connect_cancel,
+            )
+            .await
+        };
         self.inflight.lock().expect("inflight").remove(profile_id);
         if let Ok(trust) = trust.lock() {
             let _ = self.store.save_trust(&trust);
         }
         match result {
             Ok((session, live)) => {
+                self.pending_auth
+                    .lock()
+                    .expect("pending")
+                    .remove(profile_id);
                 self.persist_secrets(
                     &profile,
                     typed_password,
@@ -338,7 +454,14 @@ impl TunnelManager {
                     warnings,
                 })
             }
-            Err(err) => {
+            Err(failure) => {
+                if let Some(pending) = failure.resume {
+                    self.pending_auth
+                        .lock()
+                        .expect("pending")
+                        .insert(profile_id.to_string(), pending);
+                }
+                let err = failure.error;
                 if err.code != "cancelled" {
                     let message = sanitize_secret(&err.message, secret_view.as_deref());
                     let target = profile_target_label(&profile);
@@ -361,7 +484,14 @@ impl TunnelManager {
     pub async fn cancel_connect(&self, profile_id: &str) -> Result<(), AppError> {
         if let Some(cancel) = self.inflight.lock().expect("inflight").remove(profile_id) {
             cancel.cancel();
-            return Ok(());
+        }
+        let pending = self
+            .pending_auth
+            .lock()
+            .expect("pending")
+            .remove(profile_id);
+        if let Some(pending) = pending {
+            teardown_pending(pending).await;
         }
         let running = self.running.lock().expect("running").remove(profile_id);
         if let Some(running) = running {
@@ -407,9 +537,17 @@ impl TunnelManager {
             Arc::clone(&running.live)
         };
         let forward_id = forward.id.clone();
+        let profiles_on_disk = if persist {
+            let profiles = self.store.load_profiles()?;
+            if !profiles.iter().any(|item| item.id == profile_id) {
+                return Err(AppError::new("not_found", "找不到这条隧道"));
+            }
+            Some(profiles)
+        } else {
+            None
+        };
         live.add_forward(forward).await?;
-        if persist {
-            let mut profiles = self.store.load_profiles()?;
+        if let Some(mut profiles) = profiles_on_disk {
             let Some(profile) = profiles.iter_mut().find(|item| item.id == profile_id) else {
                 let _ = live.remove_forward(&forward_id).await;
                 return Err(AppError::new("not_found", "找不到这条隧道"));
@@ -419,16 +557,18 @@ impl TunnelManager {
             }
             if let Err(err) = self.store.save_profiles(&profiles) {
                 let rollback = live.remove_forward(&forward_id).await;
-                if rollback.is_err() {
-                    return Err(AppError::new(
+                return Err(if rollback.is_err() {
+                    AppError::new(
                         "persist_rollback_failed",
                         format!(
-                            "配置保存失败且无法完全回滚运行时映射：{}",
+                            "配置保存失败且运行时回滚也失败。映射可能仍在运行：{}",
                             rollback.unwrap_err().message
                         ),
-                    ));
-                }
-                return Err(err);
+                    )
+                    .with_persist_state(true, false)
+                } else {
+                    err.with_persist_state(false, false)
+                });
             }
         }
         self.publish();
@@ -448,18 +588,46 @@ impl TunnelManager {
             };
             Arc::clone(&running.live)
         };
+        let removed_mapping = if persist {
+            let profiles = self.store.load_profiles()?;
+            let mapping = profiles
+                .iter()
+                .find(|item| item.id == profile_id)
+                .and_then(|profile| profile.forwards.iter().find(|f| f.id == forward_id))
+                .cloned();
+            Some((profiles, mapping))
+        } else {
+            None
+        };
         live.remove_forward(forward_id).await?;
-        if persist {
-            let mut profiles = self.store.load_profiles()?;
+        if let Some((mut profiles, mapping)) = removed_mapping {
             let Some(profile) = profiles.iter_mut().find(|item| item.id == profile_id) else {
                 return Err(AppError::new("not_found", "找不到这条隧道"));
             };
             profile.forwards.retain(|item| item.id != forward_id);
             if let Err(err) = self.store.save_profiles(&profiles) {
-                return Err(AppError::new(
-                    "persist_failed",
-                    format!("映射已从运行时移除，但配置保存失败：{}", err.message),
-                ));
+                if let Some(mapping) = mapping {
+                    if let Ok(validated) = crate::forward::validate_mapping(&mapping) {
+                        let restore = live.add_forward(validated).await;
+                        return Err(if restore.is_err() {
+                            AppError::new(
+                                "persist_compensate_failed",
+                                format!(
+                                    "配置未保存且无法把映射恢复到运行态：{}",
+                                    restore.unwrap_err().message
+                                ),
+                            )
+                            .with_persist_state(false, true)
+                        } else {
+                            AppError::new(
+                                "persist_failed",
+                                format!("配置保存失败，映射已恢复到运行态：{}", err.message),
+                            )
+                            .with_persist_state(true, false)
+                        });
+                    }
+                }
+                return Err(err.with_persist_state(false, true));
             }
         }
         self.publish();
@@ -658,6 +826,7 @@ impl TunnelManager {
             forwards,
             password,
             passphrase,
+            passphrases_by_host: HashMap::new(),
         })
     }
 
@@ -886,12 +1055,12 @@ pub async fn start_session(
     trust_path: PathBuf,
     trust: Arc<Mutex<TrustStore>>,
     cancel: CancellationToken,
-) -> Result<StartedSession, AppError> {
+) -> Result<StartedSession, SessionFailure> {
     if spec.hops.is_empty() {
-        return Err(AppError::new("invalid_target", "没有可连接的主机"));
+        return Err(AppError::new("invalid_target", "没有可连接的主机").into());
     }
     if spec.forwards.is_empty() {
-        return Err(AppError::new("no_forwards", "至少需要一条端口映射"));
+        return Err(AppError::new("no_forwards", "至少需要一条端口映射").into());
     }
     let snapshot = Arc::new(Mutex::new(TunnelSnapshot {
         profile_id: spec.profile_id.clone(),
@@ -906,7 +1075,7 @@ pub async fn start_session(
         connected_at: None,
     }));
     let done = Arc::new(tokio::sync::Notify::new());
-    let (ready_tx, ready_rx) = oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), SessionFailure>>();
     let (live_tx, live_rx) = oneshot::channel::<Arc<LiveRuntime>>();
     let task_snapshot = snapshot.clone();
     let task_cancel = cancel.clone();
@@ -943,18 +1112,19 @@ pub async fn start_session(
                     }
                 }
             }
-            Err(err) => {
-                set_phase(&task_snapshot, Phase::Failed, &err.message, None);
-                let _ = ready_tx.send(Err(err));
+            Err(failure) => {
+                set_phase(&task_snapshot, Phase::Failed, &failure.error.message, None);
+                let _ = ready_tx.send(Err(failure));
             }
         }
         task_done.notify_one();
     });
     match ready_rx.await {
         Ok(Ok(())) => {
-            let live = live_rx
-                .await
-                .map_err(|_| AppError::new("ssh", "连接任务未返回会话句柄"))?;
+            let live = live_rx.await.map_err(|_| SessionFailure {
+                error: AppError::new("ssh", "连接任务未返回会话句柄"),
+                resume: None,
+            })?;
             Ok((
                 ActiveSession {
                     snapshot,
@@ -964,8 +1134,75 @@ pub async fn start_session(
                 live,
             ))
         }
-        Ok(Err(err)) => Err(err),
-        Err(_) => Err(AppError::new("ssh", "连接任务意外结束")),
+        Ok(Err(failure)) => Err(failure),
+        Err(_) => Err(AppError::new("ssh", "连接任务意外结束").into()),
+    }
+}
+
+pub async fn continue_pending_session(
+    pending: PendingAuth,
+    prompter: Arc<dyn HostKeyPrompter>,
+    cancel: CancellationToken,
+) -> Result<StartedSession, SessionFailure> {
+    if cancel.is_cancelled() {
+        teardown_pending(pending).await;
+        return Err(AppError::new("cancelled", "连接已取消").into());
+    }
+    let snapshot = pending.snapshot.clone();
+    let done = Arc::new(tokio::sync::Notify::new());
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), SessionFailure>>();
+    let (live_tx, live_rx) = oneshot::channel::<Arc<LiveRuntime>>();
+    let task_cancel = cancel.clone();
+    let task_done = done.clone();
+    let task_snapshot = snapshot.clone();
+    tokio::spawn(async move {
+        let outcome = resume_pending_auth(pending, prompter, task_cancel.clone()).await;
+        match outcome {
+            Ok(runtime) => {
+                let runtime = Arc::new(runtime);
+                set_phase(
+                    &task_snapshot,
+                    Phase::Connected,
+                    "认证成功，端口映射已绑定",
+                    None,
+                );
+                let _ = live_tx.send(Arc::clone(&runtime));
+                let _ = ready_tx.send(Ok(()));
+                tokio::select! {
+                    _ = task_cancel.cancelled() => {
+                        cleanup_shared(runtime, false).await;
+                        set_phase(&task_snapshot, Phase::Disconnected, "已断开", None);
+                    }
+                    _ = runtime.lost.notified() => {
+                        cleanup_shared(runtime, true).await;
+                        set_phase(&task_snapshot, Phase::Failed, "SSH 连接已中断", None);
+                    }
+                }
+            }
+            Err(failure) => {
+                set_phase(&task_snapshot, Phase::Failed, &failure.error.message, None);
+                let _ = ready_tx.send(Err(failure));
+            }
+        }
+        task_done.notify_one();
+    });
+    match ready_rx.await {
+        Ok(Ok(())) => {
+            let live = live_rx.await.map_err(|_| SessionFailure {
+                error: AppError::new("ssh", "恢复连接未返回会话句柄"),
+                resume: None,
+            })?;
+            Ok((
+                ActiveSession {
+                    snapshot,
+                    cancel,
+                    done,
+                },
+                live,
+            ))
+        }
+        Ok(Err(failure)) => Err(failure),
+        Err(_) => Err(AppError::new("ssh", "恢复连接意外结束").into()),
     }
 }
 
@@ -1175,74 +1412,55 @@ impl LiveRuntime {
     }
 }
 
-async fn run_session(
-    spec: SessionSpec,
-    prompter: Arc<dyn HostKeyPrompter>,
-    trust_path: PathBuf,
-    trust: Arc<Mutex<TrustStore>>,
+async fn resume_pending_auth(
+    mut pending: PendingAuth,
+    _prompter: Arc<dyn HostKeyPrompter>,
+    cancel: CancellationToken,
+) -> Result<LiveRuntime, SessionFailure> {
+    let endpoint = pending.hops[pending.hop_index].clone();
+    let mut handle = pending
+        .pending
+        .lock()
+        .expect("pending")
+        .take()
+        .ok_or_else(|| AppError::new("ssh", "没有待恢复的会话"))?;
+    if cancel.is_cancelled() {
+        pending.pending.lock().expect("pending").replace(handle);
+        return Err(AppError::new("cancelled", "连接已取消").into());
+    }
+    set_phase(&pending.snapshot, Phase::Authenticating, "正在认证", None);
+    if let Err(err) = authenticate_final(&mut handle, &endpoint, &pending.spec).await {
+        pending.pending.lock().expect("pending").replace(handle);
+        return Err(SessionFailure {
+            error: err.with_challenge(&endpoint.host, "target"),
+            resume: Some(pending),
+        });
+    }
+    let kept = std::mem::take(&mut *pending.kept.lock().expect("kept"));
+    let proxies = std::mem::take(&mut *pending.proxies.lock().expect("proxies"));
+    assemble_live_runtime(
+        handle,
+        kept,
+        proxies,
+        &pending.spec,
+        pending.remote_rules,
+        pending.snapshot,
+        cancel,
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .await
+}
+
+async fn assemble_live_runtime(
+    handle: client::Handle<ClientHandler>,
+    kept: Vec<client::Handle<ClientHandler>>,
+    proxies: Vec<tokio::process::Child>,
+    spec: &SessionSpec,
+    shared_remote_rules: Arc<Mutex<Vec<RemoteRule>>>,
     snapshot: Arc<Mutex<TunnelSnapshot>>,
     cancel: CancellationToken,
-) -> Result<LiveRuntime, AppError> {
-    let lost = Arc::new(tokio::sync::Notify::new());
-    let config = Arc::new(client_config());
-    let mut kept = Vec::new();
-    let mut proxies = Vec::new();
-    let mut current: Option<client::Handle<ClientHandler>> = None;
-    let hop_count = spec.hops.len();
-    let shared_remote_rules = Arc::new(Mutex::new(
-        spec.forwards
-            .iter()
-            .filter(|forward| forward.direction == Direction::Remote)
-            .map(|forward| RemoteRule {
-                listen_port: forward.listen_port,
-                destination_host: forward.destination_host.clone(),
-                destination_port: forward.destination_port,
-            })
-            .collect::<Vec<_>>(),
-    ));
-    for (index, endpoint) in spec.hops.iter().enumerate() {
-        if cancel.is_cancelled() {
-            return Err(AppError::new("cancelled", "连接已取消"));
-        }
-        let last = index + 1 == hop_count;
-        let handler = ClientHandler {
-            host: endpoint.host.clone(),
-            port: endpoint.port,
-            host_key_alias: endpoint.host_key_alias.clone(),
-            known_hosts: endpoint.known_hosts_files.clone(),
-            revoked_host_keys: endpoint.revoked_host_keys.clone(),
-            trust: trust.clone(),
-            trust_path: trust_path.clone(),
-            prompter: prompter.clone(),
-            remote_rules: if last {
-                Arc::clone(&shared_remote_rules)
-            } else {
-                Arc::new(Mutex::new(Vec::new()))
-            },
-            accept_forwards: last,
-            cancel: cancel.clone(),
-            session_lost: lost.clone(),
-        };
-        let mut handle = connect_hop(
-            config.clone(),
-            endpoint,
-            current.as_ref(),
-            handler,
-            &mut proxies,
-        )
-        .await?;
-        if last {
-            set_phase(&snapshot, Phase::Authenticating, "正在认证", None);
-            authenticate_final(&mut handle, endpoint, &spec).await?;
-        } else {
-            authenticate_jump(&mut handle, endpoint, spec.passphrase.as_ref()).await?;
-        }
-        if let Some(previous) = current.take() {
-            kept.push(previous);
-        }
-        current = Some(handle);
-    }
-    let handle = current.ok_or_else(|| AppError::new("ssh", "没有可用的 SSH 会话"))?;
+    lost: Arc<tokio::sync::Notify>,
+) -> Result<LiveRuntime, SessionFailure> {
     set_phase(&snapshot, Phase::Binding, "正在绑定端口映射", None);
     let mut statuses = Vec::new();
     let mut listeners = Vec::new();
@@ -1259,16 +1477,19 @@ async fn run_session(
             Err(err) => {
                 drop(listeners);
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+                teardown_hops(kept, proxies).await;
                 if err.kind() == std::io::ErrorKind::AddrInUse {
                     return Err(AppError::new(
                         "port_in_use",
                         format!("本地端口 {} 已被占用", forward.listen_port),
-                    ));
+                    )
+                    .into());
                 }
                 return Err(AppError::new(
                     "bind_failed",
                     format!("无法绑定本地端口 {}: {err}", forward.listen_port),
-                ));
+                )
+                .into());
             }
         }
     }
@@ -1300,7 +1521,8 @@ async fn run_session(
                 }
                 let handle = shared.lock().await;
                 let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
-                return Err(AppError::from(err));
+                teardown_hops(kept, proxies).await;
+                return Err(AppError::from(err).into());
             }
         }
     }
@@ -1353,6 +1575,112 @@ async fn run_session(
         cancel,
         ops: tokio::sync::Mutex::new(()),
     })
+}
+
+async fn run_session(
+    spec: SessionSpec,
+    prompter: Arc<dyn HostKeyPrompter>,
+    trust_path: PathBuf,
+    trust: Arc<Mutex<TrustStore>>,
+    snapshot: Arc<Mutex<TunnelSnapshot>>,
+    cancel: CancellationToken,
+) -> Result<LiveRuntime, SessionFailure> {
+    let lost = Arc::new(tokio::sync::Notify::new());
+    let config = Arc::new(client_config());
+    let mut kept = Vec::new();
+    let mut proxies = Vec::new();
+    let mut current: Option<client::Handle<ClientHandler>> = None;
+    let hop_count = spec.hops.len();
+    let shared_remote_rules = Arc::new(Mutex::new(
+        spec.forwards
+            .iter()
+            .filter(|forward| forward.direction == Direction::Remote)
+            .map(|forward| RemoteRule {
+                listen_port: forward.listen_port,
+                destination_host: forward.destination_host.clone(),
+                destination_port: forward.destination_port,
+            })
+            .collect::<Vec<_>>(),
+    ));
+    for (index, endpoint) in spec.hops.iter().enumerate() {
+        if cancel.is_cancelled() {
+            teardown_hops(kept, proxies).await;
+            return Err(AppError::new("cancelled", "连接已取消").into());
+        }
+        let last = index + 1 == hop_count;
+        let handler = ClientHandler {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            host_key_alias: endpoint.host_key_alias.clone(),
+            known_hosts: endpoint.known_hosts_files.clone(),
+            revoked_host_keys: endpoint.revoked_host_keys.clone(),
+            trust: trust.clone(),
+            trust_path: trust_path.clone(),
+            prompter: prompter.clone(),
+            remote_rules: if last {
+                Arc::clone(&shared_remote_rules)
+            } else {
+                Arc::new(Mutex::new(Vec::new()))
+            },
+            accept_forwards: last,
+            cancel: cancel.clone(),
+            session_lost: lost.clone(),
+        };
+        let mut handle = connect_hop(
+            config.clone(),
+            endpoint,
+            current.as_ref(),
+            handler,
+            &mut proxies,
+        )
+        .await?;
+        if last {
+            set_phase(&snapshot, Phase::Authenticating, "正在认证", None);
+            if let Err(err) = authenticate_final(&mut handle, endpoint, &spec).await {
+                return Err(SessionFailure {
+                    error: err.with_challenge(&endpoint.host, "target"),
+                    resume: Some(PendingAuth {
+                        spec: spec.clone(),
+                        hops: spec.hops.clone(),
+                        hop_index: index,
+                        kept: Mutex::new(kept),
+                        proxies: Mutex::new(proxies),
+                        pending: Mutex::new(Some(handle)),
+                        trust,
+                        trust_path,
+                        snapshot,
+                        remote_rules: shared_remote_rules,
+                        cancel,
+                    }),
+                });
+            }
+        } else if let Err(err) =
+            authenticate_jump(&mut handle, endpoint, spec.passphrase_for(endpoint)).await
+        {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            teardown_hops(kept, proxies).await;
+            return Err(SessionFailure {
+                error: err,
+                resume: None,
+            });
+        }
+        if let Some(previous) = current.take() {
+            kept.push(previous);
+        }
+        current = Some(handle);
+    }
+    let handle = current.ok_or_else(|| AppError::new("ssh", "没有可用的 SSH 会话"))?;
+    assemble_live_runtime(
+        handle,
+        kept,
+        proxies,
+        &spec,
+        shared_remote_rules,
+        snapshot,
+        cancel,
+        lost,
+    )
+    .await
 }
 
 async fn connect_hop(
@@ -1565,7 +1893,14 @@ impl Handler for ClientHandler {
                     algorithm: algorithm.clone(),
                     fingerprint: fingerprint.clone(),
                 };
-                if !self.prompter.confirm_unknown(&prompt).await {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        return Err(AppError::new("cancelled", "连接已取消"));
+                    }
+                    accepted = self.prompter.confirm_unknown(&prompt) => accepted,
+                };
+                if !accepted {
                     return Err(AppError::new(
                         "host_key_rejected",
                         "未信任该主机密钥，连接已取消",
@@ -1729,11 +2064,7 @@ async fn authenticate_final(
                 {
                     FileAttempt::Success => return Ok(()),
                     FileAttempt::NeedsPassphrase => saw_encrypted_key = true,
-                    FileAttempt::Rejected => {
-                        if spec.passphrase.is_some() {
-                            saw_passphrase_rejected = true;
-                        }
-                    }
+                    FileAttempt::Rejected => {}
                     FileAttempt::Failed { notes: found } => notes.extend(found),
                 }
             }
@@ -1786,11 +2117,7 @@ async fn authenticate_final(
                     FileAttempt::NeedsPassphrase => {
                         return Err(AppError::new("passphrase_required", "私钥已加密，需要口令"));
                     }
-                    FileAttempt::Rejected => {
-                        if spec.passphrase.is_some() {
-                            saw_passphrase_rejected = true;
-                        }
-                    }
+                    FileAttempt::Rejected => {}
                     FileAttempt::Failed { notes: found } => notes.extend(found),
                 }
             }
@@ -1911,9 +2238,10 @@ async fn authenticate_jump(
         FileAttempt::Rejected => {
             if passphrase.is_some() {
                 Err(AppError::new(
-                    "passphrase_rejected",
-                    format!("跳板 {} 的私钥口令不正确", endpoint.host),
-                ))
+                    "auth_failed",
+                    format!("跳板 {} 拒绝了当前密钥", endpoint.host),
+                )
+                .with_challenge(&endpoint.host, "jump"))
             } else {
                 Err(AppError::new(
                     "jump_auth_failed",
@@ -1927,7 +2255,8 @@ async fn authenticate_jump(
         FileAttempt::NeedsPassphrase => Err(AppError::new(
             "passphrase_required",
             format!("跳板 {} 的私钥已加密，需要口令", endpoint.host),
-        )),
+        )
+        .with_challenge(&endpoint.host, "jump")),
         FileAttempt::Failed { notes } => {
             let detail = notes
                 .iter()

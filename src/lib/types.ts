@@ -137,6 +137,10 @@ export type TrustStore = {
 export type AppErrorBody = {
   code: string
   message: string
+  challengeHost?: string | null
+  challengeHop?: string | null
+  runtimeApplied?: boolean | null
+  persistApplied?: boolean | null
 }
 
 export type ConnectRequest = {
@@ -145,6 +149,7 @@ export type ConnectRequest = {
   keyPassphrase: string | null
   rememberServerPassword: boolean
   rememberKeyPassphrase: boolean
+  challengeHost?: string | null
 }
 
 export type HostKeyEvent = {

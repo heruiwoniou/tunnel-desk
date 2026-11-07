@@ -25,7 +25,14 @@ export function asAppError(error: unknown): AppErrorBody {
   if (error && typeof error === "object") {
     const record = error as Partial<AppErrorBody>
     if (typeof record.message === "string") {
-      return { code: record.code ?? "ssh", message: record.message }
+      return {
+        code: record.code ?? "ssh",
+        message: record.message,
+        challengeHost: record.challengeHost ?? null,
+        challengeHop: record.challengeHop ?? null,
+        runtimeApplied: record.runtimeApplied ?? null,
+        persistApplied: record.persistApplied ?? null,
+      }
     }
   }
   if (typeof error === "string" && error.trim()) {
@@ -168,6 +175,14 @@ export function onHostKey(handler: (prompt: HostKeyEvent) => void): Promise<Unli
   return listen<HostKeyEvent>("hostkey-required", (event) => handler(event.payload))
 }
 
-export function onNeedsInput(handler: (payload: { profileId: string; code: string; message: string }) => void) {
+export function onNeedsInput(
+  handler: (payload: {
+    profileId: string
+    code: string
+    message: string
+    challengeHost?: string | null
+    challengeHop?: string | null
+  }) => void,
+) {
   return listen<{ profileId: string; code: string; message: string }>("connect-needs-input", (event) => handler(event.payload))
 }

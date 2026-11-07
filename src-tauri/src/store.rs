@@ -1,14 +1,34 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::AppError;
 use crate::known_hosts::TrustStore;
 use crate::model::{HistoryEntry, Profile, Settings};
 
+#[cfg(test)]
+static FAIL_PROFILE_LOAD: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FAIL_PROFILE_SAVE: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone)]
 pub struct AppStore {
     dir: PathBuf,
+}
+
+#[cfg(test)]
+impl AppStore {
+    pub fn inject_profile_load_failure(&self, next: bool) {
+        let _ = self;
+        FAIL_PROFILE_LOAD.store(next, Ordering::SeqCst);
+    }
+
+    pub fn inject_profile_save_failure(&self, next: bool) {
+        let _ = self;
+        FAIL_PROFILE_SAVE.store(next, Ordering::SeqCst);
+    }
 }
 
 impl AppStore {
@@ -27,12 +47,20 @@ impl AppStore {
     }
 
     pub fn load_profiles(&self) -> Result<Vec<Profile>, AppError> {
+        #[cfg(test)]
+        if FAIL_PROFILE_LOAD.swap(false, Ordering::SeqCst) {
+            return Err(AppError::new("config", "injected profile load failure"));
+        }
         read_json(&self.dir.join("profiles.json"), Vec::new())
     }
 
     pub fn save_profiles(&self, profiles: &[Profile]) -> Result<(), AppError> {
         for profile in profiles {
             crate::model::ensure_profile_shape(profile)?;
+        }
+        #[cfg(test)]
+        if FAIL_PROFILE_SAVE.swap(false, Ordering::SeqCst) {
+            return Err(AppError::new("config", "injected profile save failure"));
         }
         write_json(&self.dir.join("profiles.json"), profiles)
     }
@@ -102,6 +130,77 @@ fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()
 mod tests {
     use super::*;
     use crate::model::*;
+
+    #[test]
+    fn save_profiles_surfaces_io_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppStore::open(dir.path()).unwrap();
+        let profile = Profile {
+            id: "persist".into(),
+            name: "持久化".into(),
+            target: Target::ConfigAlias { alias: "db".into() },
+            auth_mode: AuthMode::Password,
+            remember_password: false,
+            forwards: vec![ForwardMapping {
+                id: "f".into(),
+                direction: Direction::Local,
+                listen_host: "127.0.0.1".into(),
+                listen_port: 1,
+                destination_host: "127.0.0.1".into(),
+                destination_port: 1,
+                allow_external: false,
+            }],
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        store.save_profiles(std::slice::from_ref(&profile)).unwrap();
+        let path = dir.path().join("profiles.json");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = store
+            .save_profiles(std::slice::from_ref(&profile))
+            .expect_err("profiles path blocked");
+        assert!(err.code == "config" || err.code == "io");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"{").unwrap();
+        let err = store.load_profiles().expect_err("invalid json");
+        assert!(err.code == "config" || err.code == "io");
+    }
+
+    #[test]
+    fn injected_profile_failures_are_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppStore::open(dir.path()).unwrap();
+        store.inject_profile_load_failure(true);
+        assert_eq!(store.load_profiles().expect_err("load").code, "config");
+        assert!(store.load_profiles().unwrap().is_empty());
+        store.inject_profile_save_failure(true);
+        let profile = Profile {
+            id: "p".into(),
+            name: "n".into(),
+            target: Target::ConfigAlias { alias: "db".into() },
+            auth_mode: AuthMode::Password,
+            remember_password: false,
+            forwards: vec![ForwardMapping {
+                id: "f".into(),
+                direction: Direction::Local,
+                listen_host: "127.0.0.1".into(),
+                listen_port: 1,
+                destination_host: "127.0.0.1".into(),
+                destination_port: 1,
+                allow_external: false,
+            }],
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+        };
+        assert_eq!(
+            store
+                .save_profiles(std::slice::from_ref(&profile))
+                .expect_err("save")
+                .code,
+            "config"
+        );
+    }
 
     #[test]
     fn roundtrip_excludes_sentinels_and_rejects_secret_fields() {

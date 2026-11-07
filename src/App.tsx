@@ -2,6 +2,14 @@ import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
 import { CableIcon, PlusIcon, Trash2Icon, UnplugIcon } from "lucide-react"
 
+import {
+  type AuthChallengeCode,
+  type AuthChallengeContext,
+  challengeScopeLine,
+  connectRequestFromChallenge,
+  isAuthChallengeCode,
+  mergeAuthChallenge,
+} from "@/lib/auth-challenge"
 import { ProfileDialog } from "@/components/profile-dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
@@ -111,7 +119,7 @@ export default function App() {
   const [trust, setTrust] = useState<TrustStore>({ entries: [] })
   const [selectedId, setSelectedId] = useState<string | null>(desktop ? null : previewProfiles[0]?.id ?? null)
   const [editor, setEditor] = useState<Profile | "new" | null>(null)
-  const [authChallenge, setAuthChallenge] = useState<{ profileId: string; code: string; message: string } | null>(null)
+  const [authChallenge, setAuthChallenge] = useState<AuthChallengeContext | null>(null)
   const [connectingId, setConnectingId] = useState<string | null>(null)
   const [removingForwardId, setRemovingForwardId] = useState<string | null>(null)
   const [hostKey, setHostKey] = useState<HostKeyEvent | null>(null)
@@ -147,16 +155,13 @@ export default function App() {
       unlisteners.push(await onHostKey((prompt) => setHostKey(prompt)))
       unlisteners.push(
         await onNeedsInput((payload) => {
-          if (
-            payload.code === "password_required" ||
-            payload.code === "passphrase_required" ||
-            payload.code === "password_rejected" ||
-            payload.code === "passphrase_rejected"
-          ) {
+          if (isAuthChallengeCode(payload.code)) {
             setAuthChallenge({
               profileId: payload.profileId,
               code: payload.code,
               message: payload.message,
+              challengeHost: payload.challengeHost ?? null,
+              challengeHop: payload.challengeHop ?? null,
             })
             setSelectedId(payload.profileId)
           } else {
@@ -254,17 +259,40 @@ export default function App() {
       rememberServerPassword?: boolean
       rememberKeyPassphrase?: boolean
     },
+    challenge?: Pick<AuthChallengeContext, "challengeHost" | "challengeHop" | "code"> | null,
   ) {
     if (!desktop) return
     setConnectingId(profileId)
     try {
-      const outcome = await connectProfile({
-        profileId,
-        serverPassword: secrets?.serverPassword ?? null,
-        keyPassphrase: secrets?.keyPassphrase ?? null,
-        rememberServerPassword: secrets?.rememberServerPassword ?? false,
-        rememberKeyPassphrase: secrets?.rememberKeyPassphrase ?? false,
-      })
+      const active =
+        challenge ??
+        (authChallenge?.profileId === profileId
+          ? {
+              code: authChallenge.code,
+              challengeHost: authChallenge.challengeHost,
+              challengeHop: authChallenge.challengeHop,
+            }
+          : null)
+      const outcome = await connectProfile(
+        active && isAuthChallengeCode(active.code)
+          ? connectRequestFromChallenge(
+              {
+                profileId,
+                code: active.code,
+                message: "",
+                challengeHost: active.challengeHost,
+                challengeHop: active.challengeHop,
+              },
+              secrets ?? {},
+            )
+          : {
+              profileId,
+              serverPassword: secrets?.serverPassword ?? null,
+              keyPassphrase: secrets?.keyPassphrase ?? null,
+              rememberServerPassword: secrets?.rememberServerPassword ?? false,
+              rememberKeyPassphrase: secrets?.rememberKeyPassphrase ?? false,
+            },
+      )
       outcome.warnings.forEach((warning) => toast.warning(warning.message))
       toast.success(zh ? "隧道已建立" : "Tunnel is up")
       setAuthChallenge(null)
@@ -274,13 +302,9 @@ export default function App() {
       }
     } catch (error) {
       const body = asAppError(error)
-      if (
-        body.code === "password_required" ||
-        body.code === "passphrase_required" ||
-        body.code === "password_rejected" ||
-        body.code === "passphrase_rejected"
-      ) {
-        setAuthChallenge({ profileId, code: body.code, message: body.message })
+      const nextChallenge = mergeAuthChallenge(body, profileId)
+      if (nextChallenge) {
+        setAuthChallenge(nextChallenge)
       } else if (body.code === "cancelled" || body.code === "already_connecting") {
         setAuthChallenge(null)
       } else {
@@ -811,15 +835,11 @@ export default function App() {
       />
       <ConnectDialog
         open={authChallenge !== null}
-        challengeCode={
-          authChallenge?.code === "password_required" ||
-          authChallenge?.code === "passphrase_required" ||
-          authChallenge?.code === "password_rejected" ||
-          authChallenge?.code === "passphrase_rejected"
-            ? authChallenge.code
-            : null
-        }
+        challengeCode={authChallenge && isAuthChallengeCode(authChallenge.code) ? authChallenge.code : null}
         challengeMessage={authChallenge?.message ?? null}
+        challengeScope={
+          authChallenge ? challengeScopeLine(authChallenge, settings.language) : null
+        }
         language={settings.language}
         keyringAvailable={info?.keyringAvailable ?? false}
         keyringMessage={info?.keyringMessage ?? null}
@@ -1129,6 +1149,7 @@ function ConnectDialog({
   open,
   challengeCode,
   challengeMessage,
+  challengeScope,
   language,
   keyringAvailable,
   keyringMessage,
@@ -1136,13 +1157,9 @@ function ConnectDialog({
   onSubmit,
 }: {
   open: boolean
-  challengeCode:
-    | "password_required"
-    | "passphrase_required"
-    | "password_rejected"
-    | "passphrase_rejected"
-    | null
+  challengeCode: AuthChallengeCode | null
   challengeMessage: string | null
+  challengeScope: string | null
   language: Language
   keyringAvailable: boolean
   keyringMessage: string | null
@@ -1184,6 +1201,7 @@ function ConnectDialog({
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
+            {challengeScope ? <span className="block pb-2 text-muted-foreground">{challengeScope}</span> : null}
             {challengeMessage ??
               (needPassword
                 ? zh

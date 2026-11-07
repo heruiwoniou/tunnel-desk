@@ -9,6 +9,11 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Per-hop credential challenges (`challengeHost` / `challengeHop`) with partial connect
+  resume, plus Vitest coverage for auth dialog field routing.
+- Integration tests for profile persist load/save injection, concurrent runtime forward IDs,
+  host-key cancel during prompt, rejected-public-key vs wrong passphrase classification,
+  and remote forward cancel failure state.
 - On-demand SSH credential prompts after keys, certificates, the agent, and saved
   secrets are tried. The connect flow no longer opens a password dialog first.
 - Runtime add and remove of local and remote port forwards on an active tunnel,

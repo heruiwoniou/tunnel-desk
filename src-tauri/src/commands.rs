@@ -16,6 +16,7 @@ struct ConnectRequest {
     key_passphrase: Option<String>,
     remember_server_password: bool,
     remember_key_passphrase: bool,
+    challenge_host: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -222,12 +223,13 @@ async fn connect_profile(
     let manager = state.manager.clone();
     let prompter = prompter(&app, &state);
     let outcome = manager
-        .connect(
+        .connect_with_challenge(
             &request.profile_id,
             seal(request.server_password),
             seal(request.key_passphrase),
             request.remember_server_password,
             request.remember_key_passphrase,
+            request.challenge_host,
             prompter,
         )
         .await?;
@@ -336,6 +338,7 @@ async fn cancel_connect(
     state: State<'_, AppState>,
     profile_id: String,
 ) -> Result<(), AppError> {
+    state.prompts.cancel_all();
     state.manager.cancel_connect(&profile_id).await?;
     let _ = app.emit("tunnel-state", state.manager.snapshots());
     Ok(())
@@ -367,7 +370,13 @@ pub async fn connect_from_tray(
             reveal(app);
             let _ = app.emit(
                 "connect-needs-input",
-                serde_json::json!({ "profileId": profile_id, "code": err.code, "message": err.message }),
+                serde_json::json!({
+                    "profileId": profile_id,
+                    "code": err.code,
+                    "message": err.message,
+                    "challengeHost": err.challenge_host,
+                    "challengeHop": err.challenge_hop,
+                }),
             );
         }
         Err(_) => {

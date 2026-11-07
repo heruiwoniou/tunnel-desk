@@ -53,6 +53,13 @@ impl PromptHub {
             false
         }
     }
+
+    pub fn cancel_all(&self) {
+        let mut pending = self.pending.lock().expect("prompts");
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(false);
+        }
+    }
 }
 
 pub struct AppState {
