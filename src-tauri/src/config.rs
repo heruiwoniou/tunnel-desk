@@ -23,11 +23,15 @@ pub struct ResolvedHost {
     pub user: String,
     pub port: u16,
     pub identity_files: Vec<String>,
+    pub certificate_files: Vec<String>,
     pub identities_only: bool,
+    pub pubkey_authentication: bool,
     pub proxy_jump: Option<String>,
     pub proxy_command: Option<String>,
     pub identity_agent: Option<String>,
+    pub host_key_alias: Option<String>,
     pub known_hosts_files: Vec<String>,
+    pub revoked_host_keys: Vec<String>,
     pub preferred_authentications: Vec<String>,
     pub resolution: String,
     pub warnings: Vec<String>,
@@ -242,6 +246,7 @@ impl Resolver {
 struct Accumulator {
     scalars: BTreeMap<String, String>,
     identity_files: Vec<String>,
+    certificate_files: Vec<String>,
     known_hosts: Vec<String>,
     warnings: Vec<String>,
     files: BTreeSet<PathBuf>,
@@ -266,7 +271,11 @@ impl Accumulator {
             | "gssapiauthentication"
             | "canonicalizehostname"
             | "proxyusefdpass"
-            | "preferredauthentications" => {
+            | "preferredauthentications"
+            | "pubkeyauthentication"
+            | "hostkeyalias"
+            | "revokedhostkeys"
+            | "securitykeyprovider" => {
                 self.scalars.entry(keyword.to_string()).or_insert(joined);
             }
             "identityfile" => {
@@ -276,7 +285,7 @@ impl Accumulator {
             }
             "certificatefile" => {
                 if !joined.is_empty() && joined != "none" {
-                    self.warn("CertificateFile 会被列出但 TunnelDesk 不会用证书完成认证".into());
+                    self.certificate_files.push(joined);
                 }
             }
             "userknownhostsfile" | "globalknownhostsfile" => {
@@ -331,11 +340,21 @@ impl Accumulator {
             .and_then(|value| value.parse().ok())
             .unwrap_or(22);
         let port_string = port.to_string();
+        let expand_path = |path: &String| {
+            expand_tilde(
+                &expand_tokens(path, resolver, &original, &hostname, &port_string, &user),
+                &resolver.home,
+            )
+        };
         let identity_files = self
             .identity_files
             .iter()
-            .map(|path| expand_tokens(path, resolver, &original, &hostname, &port_string, &user))
-            .map(|path| expand_tilde(&path, &resolver.home))
+            .map(expand_path)
+            .collect::<Vec<_>>();
+        let certificate_files = self
+            .certificate_files
+            .iter()
+            .map(expand_path)
             .collect::<Vec<_>>();
         let proxy_jump = optional_none(self.scalars.get("proxyjump")).map(|value| {
             expand_tokens(&value, resolver, &original, &hostname, &port_string, &user)
@@ -370,19 +389,38 @@ impl Accumulator {
         };
         ResolvedHost {
             query: query.into(),
-            hostname,
-            user,
+            hostname: hostname.clone(),
+            user: user.clone(),
             port,
             identity_files,
+            certificate_files,
             identities_only: self
                 .scalars
                 .get("identitiesonly")
                 .map(|v| v == "yes")
                 .unwrap_or(false),
+            pubkey_authentication: pubkey_enabled(self.scalars.get("pubkeyauthentication")),
             proxy_jump,
             proxy_command,
             identity_agent: agent_setting(self.scalars.get("identityagent"), &resolver.home),
+            host_key_alias: optional_none(self.scalars.get("hostkeyalias")).map(|value| {
+                expand_tilde(
+                    &expand_tokens(&value, resolver, &original, &hostname, &port_string, &user),
+                    &resolver.home,
+                )
+            }),
             known_hosts_files,
+            revoked_host_keys: optional_none(self.scalars.get("revokedhostkeys"))
+                .map(|value| split_path_list(&value))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| {
+                    expand_tilde(
+                        &expand_tokens(&path, resolver, &original, &hostname, &port_string, &user),
+                        &resolver.home,
+                    )
+                })
+                .collect(),
             preferred_authentications: self
                 .scalars
                 .get("preferredauthentications")
@@ -430,6 +468,13 @@ fn push_standard_warnings(acc: &mut Accumulator, scalars: &BTreeMap<String, Stri
         acc.warn("不支持 PKCS11Provider。".into());
     }
     if scalars
+        .get("securitykeyprovider")
+        .map(|v| !v.is_empty() && v != "none")
+        .unwrap_or(false)
+    {
+        acc.warn("不支持 SecurityKeyProvider。FIDO/安全密钥没有当作已验证的登录方式。".into());
+    }
+    if scalars
         .get("proxyusefdpass")
         .map(|v| v == "yes")
         .unwrap_or(false)
@@ -464,11 +509,21 @@ fn parse_ssh_g(text: &str, resolver: &Resolver, query: &str) -> ResolvedHost {
     let port = first("port")
         .and_then(|value| value.parse().ok())
         .unwrap_or(22);
+    let expand = |path: String| expand_tilde(&path, &resolver.home);
     let identity_files = values
         .get("identityfile")
         .cloned()
         .unwrap_or_default()
         .into_iter()
+        .filter(|path| path != "none")
+        .map(expand)
+        .collect();
+    let certificate_files = values
+        .get("certificatefile")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| path != "none")
         .map(|path| expand_tilde(&path, &resolver.home))
         .collect();
     let known_hosts_files = ["userknownhostsfile", "globalknownhostsfile"]
@@ -493,12 +548,6 @@ fn parse_ssh_g(text: &str, resolver: &Resolver, query: &str) -> ResolvedHost {
     {
         acc.warn("ssh 配置里的 LocalForward / RemoteForward 不会自动启用。请在 TunnelDesk 中显式添加映射。".into());
     }
-    if values
-        .get("certificatefile")
-        .is_some_and(|items| items.iter().any(|v| v != "none" && !v.is_empty()))
-    {
-        acc.warn("CertificateFile 会被列出但 TunnelDesk 不会用证书完成认证".into());
-    }
     warnings.extend(acc.warnings);
     ResolvedHost {
         query: query.into(),
@@ -506,11 +555,22 @@ fn parse_ssh_g(text: &str, resolver: &Resolver, query: &str) -> ResolvedHost {
         user,
         port,
         identity_files,
+        certificate_files,
         identities_only: first("identitiesonly").as_deref() == Some("yes"),
+        pubkey_authentication: pubkey_enabled(scalars.get("pubkeyauthentication")),
         proxy_jump: optional_none(scalars.get("proxyjump")),
         proxy_command: optional_none(scalars.get("proxycommand")),
         identity_agent: agent_setting(scalars.get("identityagent"), &resolver.home),
+        host_key_alias: optional_none(scalars.get("hostkeyalias")),
         known_hosts_files,
+        revoked_host_keys: optional_none(scalars.get("revokedhostkeys"))
+            .map(|value| {
+                split_path_list(&value)
+                    .into_iter()
+                    .map(|path| expand_tilde(&path, &resolver.home))
+                    .collect()
+            })
+            .unwrap_or_default(),
         preferred_authentications: first("preferredauthentications")
             .map(|value| {
                 value
@@ -536,6 +596,15 @@ fn agent_setting(value: Option<&String>, home: &Path) -> Option<String> {
             Some(expand_tilde(trimmed, home))
         }
     })
+}
+
+fn pubkey_enabled(value: Option<&String>) -> bool {
+    !matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("no" | "false" | "off")
+    )
 }
 
 fn optional_none(value: Option<&String>) -> Option<String> {
@@ -930,6 +999,46 @@ Host jump
             .resolve_builtin("plain.example")
             .unwrap();
         assert_eq!(other.user, "fallback");
+    }
+
+    #[test]
+    fn certificate_files_accumulate_and_scalar_options_keep_the_first_value() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config"),
+            "\
+Host bastion
+  HostName bastion.example
+  User ops
+  Port 2222
+  IdentityFile id_a
+  IdentityFile id_b
+  CertificateFile cert_a
+  CertificateFile cert_b
+  IdentitiesOnly yes
+  IdentitiesOnly no
+  PubkeyAuthentication no
+  PubkeyAuthentication yes
+  HostKeyAlias alias.example
+  HostKeyAlias other.example
+  IdentityAgent none
+  RevokedHostKeys revoked
+",
+        )
+        .unwrap();
+        let resolved = resolver(dir.path()).resolve_builtin("bastion").unwrap();
+        assert_eq!(resolved.identity_files, vec!["id_a", "id_b"]);
+        assert_eq!(resolved.certificate_files, vec!["cert_a", "cert_b"]);
+        assert!(resolved.identities_only);
+        assert!(!resolved.pubkey_authentication);
+        assert_eq!(resolved.host_key_alias.as_deref(), Some("alias.example"));
+        assert_eq!(resolved.revoked_host_keys, vec!["revoked"]);
+        assert!(
+            !resolved
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("不会用证书"))
+        );
     }
 
     #[test]
