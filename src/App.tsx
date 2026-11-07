@@ -50,6 +50,7 @@ import {
   asAppError,
   backendInfo,
   clearHistory,
+  cancelConnect,
   connectProfile,
   deleteProfile,
   disconnectAll,
@@ -112,6 +113,7 @@ export default function App() {
   const [editor, setEditor] = useState<Profile | "new" | null>(null)
   const [authChallenge, setAuthChallenge] = useState<{ profileId: string; code: string; message: string } | null>(null)
   const [connectingId, setConnectingId] = useState<string | null>(null)
+  const [removingForwardId, setRemovingForwardId] = useState<string | null>(null)
   const [hostKey, setHostKey] = useState<HostKeyEvent | null>(null)
   const [pendingDelete, setPendingDelete] = useState<Profile | null>(null)
   const [meta, setMeta] = useState<SecretMeta | null>(null)
@@ -145,7 +147,12 @@ export default function App() {
       unlisteners.push(await onHostKey((prompt) => setHostKey(prompt)))
       unlisteners.push(
         await onNeedsInput((payload) => {
-          if (payload.code === "password_required" || payload.code === "passphrase_required") {
+          if (
+            payload.code === "password_required" ||
+            payload.code === "passphrase_required" ||
+            payload.code === "password_rejected" ||
+            payload.code === "passphrase_rejected"
+          ) {
             setAuthChallenge({
               profileId: payload.profileId,
               code: payload.code,
@@ -267,8 +274,15 @@ export default function App() {
       }
     } catch (error) {
       const body = asAppError(error)
-      if (body.code === "password_required" || body.code === "passphrase_required") {
+      if (
+        body.code === "password_required" ||
+        body.code === "passphrase_required" ||
+        body.code === "password_rejected" ||
+        body.code === "passphrase_rejected"
+      ) {
         setAuthChallenge({ profileId, code: body.code, message: body.message })
+      } else if (body.code === "cancelled" || body.code === "already_connecting") {
+        setAuthChallenge(null)
       } else {
         toast.error(explain(body.code, body.message, settings.language))
         setAuthChallenge(null)
@@ -444,12 +458,15 @@ export default function App() {
                                       <Button
                                         variant="ghost"
                                         size="sm"
-                                        onClick={() =>
+                                        disabled={removingForwardId === forward.id}
+                                        onClick={() => {
+                                          setRemovingForwardId(forward.id)
                                           void removeRuntimeForward(selected.id, forward.id, false)
                                             .then(() => runtimeSnapshots().then(setSnapshots))
                                             .then(() => toast.success(zh ? "映射已移除" : "Forward removed"))
                                             .catch((error) => toast.error(asAppError(error).message))
-                                        }
+                                            .finally(() => setRemovingForwardId(null))
+                                        }}
                                       >
                                         <Trash2Icon data-icon="inline-start" />
                                         {zh ? "移除" : "Remove"}
@@ -795,7 +812,10 @@ export default function App() {
       <ConnectDialog
         open={authChallenge !== null}
         challengeCode={
-          authChallenge?.code === "password_required" || authChallenge?.code === "passphrase_required"
+          authChallenge?.code === "password_required" ||
+          authChallenge?.code === "passphrase_required" ||
+          authChallenge?.code === "password_rejected" ||
+          authChallenge?.code === "passphrase_rejected"
             ? authChallenge.code
             : null
         }
@@ -804,7 +824,9 @@ export default function App() {
         keyringAvailable={info?.keyringAvailable ?? false}
         keyringMessage={info?.keyringMessage ?? null}
         onOpenChange={(open) => {
-          if (!open) setAuthChallenge(null)
+          if (!open && authChallenge) {
+            void cancelConnect(authChallenge.profileId).finally(() => setAuthChallenge(null))
+          }
         }}
         onSubmit={async (serverPassword, keyPassphrase, rememberServerPassword, rememberKeyPassphrase) => {
           if (!authChallenge) return
@@ -999,7 +1021,12 @@ function explain(code: string, fallback: string, language: Language) {
   const zh = language !== "en"
   const known: Record<string, string> = {
     password_required: zh ? "需要服务器密码。" : "A server password is required.",
+    password_rejected: zh ? "服务器拒绝了该密码。" : "The server rejected that password.",
     passphrase_required: zh ? "私钥已加密，需要口令。" : "The private key is encrypted and needs its passphrase.",
+    passphrase_rejected: zh ? "私钥口令不正确。" : "The private-key passphrase is incorrect.",
+    already_connecting: zh ? "已有连接正在进行。" : "A connection is already in progress.",
+    forward_cancel_failed: zh ? "服务器未确认取消远程转发。" : "The server did not confirm cancelling the remote forward.",
+    cancelled: zh ? "连接已取消。" : "The connection was cancelled.",
     auth_failed: zh ? "认证失败。" : "Authentication failed.",
     host_key_rejected: zh ? "未信任主机密钥，连接已取消。" : "The host key was not trusted.",
     host_key_changed: zh ? "主机密钥与已记录的值不一致，连接已拒绝。" : "The host key changed and the connection was refused.",
@@ -1109,7 +1136,12 @@ function ConnectDialog({
   onSubmit,
 }: {
   open: boolean
-  challengeCode: "password_required" | "passphrase_required" | null
+  challengeCode:
+    | "password_required"
+    | "passphrase_required"
+    | "password_rejected"
+    | "passphrase_rejected"
+    | null
   challengeMessage: string | null
   language: Language
   keyringAvailable: boolean
@@ -1128,9 +1160,14 @@ function ConnectDialog({
   const [rememberServer, setRememberServer] = useState(false)
   const [rememberKey, setRememberKey] = useState(false)
   const [pending, setPending] = useState(false)
-  const needPassword = challengeCode === "password_required"
-  const needPassphrase = challengeCode === "passphrase_required"
-  const title = useMemo(() => (needPassword ? (zh ? "需要服务器密码" : "Server password required") : zh ? "需要私钥口令" : "Key passphrase required"), [needPassword, zh])
+  const needPassword = challengeCode === "password_required" || challengeCode === "password_rejected"
+  const needPassphrase = challengeCode === "passphrase_required" || challengeCode === "passphrase_rejected"
+  const title = useMemo(() => {
+    if (challengeCode === "password_rejected") return zh ? "密码被拒绝" : "Password rejected"
+    if (challengeCode === "passphrase_rejected") return zh ? "口令不正确" : "Passphrase incorrect"
+    if (needPassword) return zh ? "需要服务器密码" : "Server password required"
+    return zh ? "需要私钥口令" : "Key passphrase required"
+  }, [challengeCode, needPassword, zh])
 
   useEffect(() => {
     if (!open) {

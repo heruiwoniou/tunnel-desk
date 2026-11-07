@@ -574,7 +574,7 @@ async fn rejects_bad_password_changed_key_occupied_port_and_forward_refusal() {
         Arc::new(FixedPrompter(true)),
     )
     .await;
-    assert_eq!(wrong.unwrap_err().code, "auth_failed");
+    assert_eq!(wrong.unwrap_err().code, "password_rejected");
     TcpListener::bind(("127.0.0.1", local_port))
         .await
         .expect("failed auth left no listener");

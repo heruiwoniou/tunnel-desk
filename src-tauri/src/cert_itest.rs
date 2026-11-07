@@ -585,7 +585,7 @@ Host locked
         )
         .await
         .expect_err("login password is not the key passphrase");
-    assert_eq!(wrong.code, "auth_failed");
+    assert_eq!(wrong.code, "passphrase_rejected");
     app.connect(
         "locked",
         None,

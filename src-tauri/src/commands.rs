@@ -326,7 +326,19 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         disconnect_all,
         add_runtime_forward,
         remove_runtime_forward,
+        cancel_connect,
     ]
+}
+
+#[tauri::command]
+async fn cancel_connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), AppError> {
+    state.manager.cancel_connect(&profile_id).await?;
+    let _ = app.emit("tunnel-state", state.manager.snapshots());
+    Ok(())
 }
 
 pub async fn connect_from_tray(
@@ -346,7 +358,12 @@ pub async fn connect_from_tray(
         Ok(_) => {
             let _ = app.emit("tunnel-state", manager.snapshots());
         }
-        Err(err) if err.code == "password_required" || err.code == "passphrase_required" => {
+        Err(err)
+            if err.code == "password_required"
+                || err.code == "passphrase_required"
+                || err.code == "password_rejected"
+                || err.code == "passphrase_rejected" =>
+        {
             reveal(app);
             let _ = app.emit(
                 "connect-needs-input",

@@ -33,6 +33,14 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Wrong server passwords and key passphrases (including jump hosts) surface as
+  `password_rejected` / `passphrase_rejected` so the UI can retry in place.
+  Closing the challenge dialog cancels the in-flight SSH attempt; secrets are
+  written to the keyring only after a successful connect.
+- Runtime forward add/remove is serialized, rolls back on profile save failure,
+  and does not report success when remote `cancel_tcpip_forward` fails.
+  Natural disconnect and explicit teardown always release jump hops, proxy
+  children, listeners, and channels even when multiple handles share the session.
 - Tray “Show window” and left-click restore focus on Linux when returning from
   the status icon after hide-to-tray.
 - `RevokedHostKeys` is read as one OpenSSH public key per line. A listed host

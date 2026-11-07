@@ -132,6 +132,10 @@ export function connectProfile(request: ConnectRequest) {
   return invoke<{ snapshot: TunnelSnapshot; warnings: AppErrorBody[] }>("connect_profile", { request })
 }
 
+export function cancelConnect(profileId: string) {
+  return invoke<void>("cancel_connect", { profileId })
+}
+
 export function disconnectProfile(profileId: string) {
   return invoke<void>("disconnect_profile", { profileId })
 }
