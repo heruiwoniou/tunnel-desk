@@ -1,15 +1,9 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import { toast } from "sonner"
 import { CableIcon, PlusIcon, Trash2Icon, UnplugIcon } from "lucide-react"
 
-import {
-  type AuthChallengeCode,
-  type AuthChallengeContext,
-  challengeScopeLine,
-  connectRequestFromChallenge,
-  isAuthChallengeCode,
-  mergeAuthChallenge,
-} from "@/lib/auth-challenge"
+import { type AuthChallengeContext, isAuthChallengeCode, mergeAuthChallenge } from "@/lib/auth-challenge"
+import { ConnectChallengeDialog } from "@/components/connect-challenge-dialog"
 import { ProfileDialog } from "@/components/profile-dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import {
@@ -91,6 +85,7 @@ import type {
   Direction,
   ForwardMapping,
   HistoryEntry,
+  ConnectRequest,
   HostKeyEvent,
   Language,
   Phase,
@@ -162,6 +157,8 @@ export default function App() {
               message: payload.message,
               challengeHost: payload.challengeHost ?? null,
               challengeHop: payload.challengeHop ?? null,
+              challengeId: payload.challengeId ?? null,
+              challengeEndpoint: payload.challengeEndpoint ?? null,
             })
             setSelectedId(payload.profileId)
           } else {
@@ -252,57 +249,40 @@ export default function App() {
   const runningCount = snapshots.filter((item) => busy.has(item.phase)).length
 
   async function attemptConnect(
-    profileId: string,
+    requestOrProfile:
+      | ConnectRequest
+      | string,
     secrets?: {
       serverPassword?: string | null
       keyPassphrase?: string | null
       rememberServerPassword?: boolean
       rememberKeyPassphrase?: boolean
     },
-    challenge?: Pick<AuthChallengeContext, "challengeHost" | "challengeHop" | "code"> | null,
   ) {
     if (!desktop) return
-    setConnectingId(profileId)
+    const request: ConnectRequest =
+      typeof requestOrProfile === "string"
+        ? {
+            profileId: requestOrProfile,
+            serverPassword: secrets?.serverPassword ?? null,
+            keyPassphrase: secrets?.keyPassphrase ?? null,
+            rememberServerPassword: secrets?.rememberServerPassword ?? false,
+            rememberKeyPassphrase: secrets?.rememberKeyPassphrase ?? false,
+          }
+        : requestOrProfile
+    setConnectingId(request.profileId)
     try {
-      const active =
-        challenge ??
-        (authChallenge?.profileId === profileId
-          ? {
-              code: authChallenge.code,
-              challengeHost: authChallenge.challengeHost,
-              challengeHop: authChallenge.challengeHop,
-            }
-          : null)
-      const outcome = await connectProfile(
-        active && isAuthChallengeCode(active.code)
-          ? connectRequestFromChallenge(
-              {
-                profileId,
-                code: active.code,
-                message: "",
-                challengeHost: active.challengeHost,
-                challengeHop: active.challengeHop,
-              },
-              secrets ?? {},
-            )
-          : {
-              profileId,
-              serverPassword: secrets?.serverPassword ?? null,
-              keyPassphrase: secrets?.keyPassphrase ?? null,
-              rememberServerPassword: secrets?.rememberServerPassword ?? false,
-              rememberKeyPassphrase: secrets?.rememberKeyPassphrase ?? false,
-            },
-      )
+      const outcome = await connectProfile(request)
       outcome.warnings.forEach((warning) => toast.warning(warning.message))
       toast.success(zh ? "隧道已建立" : "Tunnel is up")
       setAuthChallenge(null)
       setSnapshots(await runtimeSnapshots())
-      if (selected?.id === profileId) {
-        setMeta(await secretMeta(profileId).catch(() => null))
+      if (selected?.id === request.profileId) {
+        setMeta(await secretMeta(request.profileId).catch(() => null))
       }
     } catch (error) {
       const body = asAppError(error)
-      const nextChallenge = mergeAuthChallenge(body, profileId)
+      const nextChallenge = mergeAuthChallenge(body, request.profileId)
       if (nextChallenge) {
         setAuthChallenge(nextChallenge)
       } else if (body.code === "cancelled" || body.code === "already_connecting") {
@@ -833,13 +813,9 @@ export default function App() {
         }}
         onSave={onSave}
       />
-      <ConnectDialog
+      <ConnectChallengeDialog
         open={authChallenge !== null}
-        challengeCode={authChallenge && isAuthChallengeCode(authChallenge.code) ? authChallenge.code : null}
-        challengeMessage={authChallenge?.message ?? null}
-        challengeScope={
-          authChallenge ? challengeScopeLine(authChallenge, settings.language) : null
-        }
+        challenge={authChallenge}
         language={settings.language}
         keyringAvailable={info?.keyringAvailable ?? false}
         keyringMessage={info?.keyringMessage ?? null}
@@ -848,14 +824,8 @@ export default function App() {
             void cancelConnect(authChallenge.profileId).finally(() => setAuthChallenge(null))
           }
         }}
-        onSubmit={async (serverPassword, keyPassphrase, rememberServerPassword, rememberKeyPassphrase) => {
-          if (!authChallenge) return
-          await attemptConnect(authChallenge.profileId, {
-            serverPassword,
-            keyPassphrase,
-            rememberServerPassword,
-            rememberKeyPassphrase,
-          })
+        onSubmit={async (request) => {
+          await attemptConnect(request)
         }}
       />
       <Dialog open={hostKey !== null} onOpenChange={(open) => !open && hostKey && void answerHostKey(false)}>
@@ -1142,159 +1112,5 @@ function RuntimeForwardAdd({
         {zh ? "添加" : "Add"}
       </Button>
     </div>
-  )
-}
-
-function ConnectDialog({
-  open,
-  challengeCode,
-  challengeMessage,
-  challengeScope,
-  language,
-  keyringAvailable,
-  keyringMessage,
-  onOpenChange,
-  onSubmit,
-}: {
-  open: boolean
-  challengeCode: AuthChallengeCode | null
-  challengeMessage: string | null
-  challengeScope: string | null
-  language: Language
-  keyringAvailable: boolean
-  keyringMessage: string | null
-  onOpenChange: (open: boolean) => void
-  onSubmit: (
-    serverPassword: string | null,
-    keyPassphrase: string | null,
-    rememberServerPassword: boolean,
-    rememberKeyPassphrase: boolean,
-  ) => Promise<void>
-}) {
-  const zh = language !== "en"
-  const [serverPassword, setServerPassword] = useState("")
-  const [keyPassphrase, setKeyPassphrase] = useState("")
-  const [rememberServer, setRememberServer] = useState(false)
-  const [rememberKey, setRememberKey] = useState(false)
-  const [pending, setPending] = useState(false)
-  const needPassword = challengeCode === "password_required" || challengeCode === "password_rejected"
-  const needPassphrase = challengeCode === "passphrase_required" || challengeCode === "passphrase_rejected"
-  const title = useMemo(() => {
-    if (challengeCode === "password_rejected") return zh ? "密码被拒绝" : "Password rejected"
-    if (challengeCode === "passphrase_rejected") return zh ? "口令不正确" : "Passphrase incorrect"
-    if (needPassword) return zh ? "需要服务器密码" : "Server password required"
-    return zh ? "需要私钥口令" : "Key passphrase required"
-  }, [challengeCode, needPassword, zh])
-
-  useEffect(() => {
-    if (!open) {
-      setServerPassword("")
-      setKeyPassphrase("")
-      setRememberServer(false)
-      setRememberKey(false)
-    }
-  }, [open])
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>
-            {challengeScope ? <span className="block pb-2 text-muted-foreground">{challengeScope}</span> : null}
-            {challengeMessage ??
-              (needPassword
-                ? zh
-                  ? "SSH 服务器要求密码。密钥与证书已尝试完毕。"
-                  : "The SSH server wants a password. Keys and certificates were already tried."
-                : zh
-                  ? "需要口令来解密私钥或签名证书。"
-                  : "A passphrase is needed to decrypt the private key or sign the certificate.")}
-          </DialogDescription>
-        </DialogHeader>
-        <FieldGroup>
-          {needPassword ? (
-            <>
-              <Field>
-                <FieldLabel htmlFor="server-password">{zh ? "服务器密码" : "Server password"}</FieldLabel>
-                <Input
-                  id="server-password"
-                  type="password"
-                  autoComplete="off"
-                  value={serverPassword}
-                  onChange={(event) => setServerPassword(event.target.value)}
-                />
-              </Field>
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  checked={rememberServer && keyringAvailable}
-                  disabled={!keyringAvailable}
-                  onCheckedChange={(checked) => setRememberServer(checked === true)}
-                />
-                {zh ? "把服务器密码记入系统钥匙串" : "Store the server password in the OS keyring"}
-              </label>
-            </>
-          ) : null}
-          {needPassphrase ? (
-            <>
-              <Field>
-                <FieldLabel htmlFor="key-passphrase">{zh ? "私钥口令" : "Key passphrase"}</FieldLabel>
-                <Input
-                  id="key-passphrase"
-                  type="password"
-                  autoComplete="off"
-                  value={keyPassphrase}
-                  onChange={(event) => setKeyPassphrase(event.target.value)}
-                />
-                <FieldDescription>{zh ? "只用于解开私钥，不会当作服务器密码。" : "Used only to unlock a private key, not as the server password."}</FieldDescription>
-              </Field>
-              <label className="flex items-center gap-2 text-sm">
-                <Checkbox
-                  checked={rememberKey && keyringAvailable}
-                  disabled={!keyringAvailable}
-                  onCheckedChange={(checked) => setRememberKey(checked === true)}
-                />
-                {zh ? "把私钥口令记入系统钥匙串" : "Store the key passphrase in the OS keyring"}
-              </label>
-            </>
-          ) : null}
-          {!keyringAvailable ? (
-            <Alert>
-              <AlertTitle>{zh ? "不能记住密码" : "Cannot remember a password"}</AlertTitle>
-              <AlertDescription>
-                {keyringMessage ??
-                  (zh ? "钥匙串不可用时不会改用明文文件。" : "There is no plaintext fallback when the keyring is unavailable.")}
-              </AlertDescription>
-            </Alert>
-          ) : null}
-        </FieldGroup>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            {zh ? "取消" : "Cancel"}
-          </Button>
-          <Button
-            disabled={pending || (needPassword && !serverPassword.trim()) || (needPassphrase && !keyPassphrase.trim())}
-            onClick={() => {
-              const password = needPassword ? serverPassword : null
-              const passphrase = needPassphrase ? keyPassphrase : null
-              const rememberPassword = rememberServer
-              const rememberPassphrase = rememberKey
-              setServerPassword("")
-              setKeyPassphrase("")
-              setPending(true)
-              void onSubmit(
-                password?.trim() ? password : null,
-                passphrase?.trim() ? passphrase : null,
-                rememberPassword,
-                rememberPassphrase,
-              ).finally(() => setPending(false))
-            }}
-          >
-            {pending ? <Spinner data-icon="inline-start" /> : null}
-            {zh ? "继续连接" : "Continue"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }

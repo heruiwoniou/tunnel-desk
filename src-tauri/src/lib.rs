@@ -32,21 +32,31 @@ use crate::tunnel::TunnelManager;
 
 pub struct PromptHub {
     pending: Mutex<std::collections::HashMap<String, oneshot::Sender<bool>>>,
+    owners: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl PromptHub {
     fn new() -> Self {
         Self {
             pending: Mutex::new(std::collections::HashMap::new()),
+            owners: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    fn insert(&self, id: String, sender: oneshot::Sender<bool>) {
-        self.pending.lock().expect("prompts").insert(id, sender);
+    fn insert(&self, profile_id: &str, id: String, sender: oneshot::Sender<bool>) {
+        self.pending
+            .lock()
+            .expect("prompts")
+            .insert(id.clone(), sender);
+        self.owners
+            .lock()
+            .expect("owners")
+            .insert(id, profile_id.to_string());
     }
 
     fn respond(&self, id: &str, accept: bool) -> bool {
         if let Some(sender) = self.pending.lock().expect("prompts").remove(id) {
+            self.owners.lock().expect("owners").remove(id);
             let _ = sender.send(accept);
             true
         } else {
@@ -54,8 +64,32 @@ impl PromptHub {
         }
     }
 
+    pub fn cancel_for(&self, profile_id: &str) {
+        let owners = self.owners.lock().expect("owners");
+        let ids: Vec<String> = owners
+            .iter()
+            .filter_map(|(id, owner)| {
+                if owner == profile_id {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        drop(owners);
+        let mut pending = self.pending.lock().expect("prompts");
+        let mut owners = self.owners.lock().expect("owners");
+        for id in ids {
+            if let Some(sender) = pending.remove(&id) {
+                let _ = sender.send(false);
+            }
+            owners.remove(&id);
+        }
+    }
+
     pub fn cancel_all(&self) {
         let mut pending = self.pending.lock().expect("prompts");
+        self.owners.lock().expect("owners").clear();
         for (_, sender) in pending.drain() {
             let _ = sender.send(false);
         }

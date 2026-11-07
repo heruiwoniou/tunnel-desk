@@ -1000,8 +1000,9 @@ Host db
         "a key passphrase prompt must not fall through to the server password"
     );
     manager
-        .connect(
+        .connect_challenge_response(
             "key",
+            &missing_phrase,
             None,
             Some(Zeroizing::new(passphrase.clone())),
             false,
@@ -1036,8 +1037,9 @@ Host db
         .unwrap_err();
     assert_eq!(wrong.code, "password_rejected");
     manager
-        .connect(
+        .connect_challenge_response(
             "pw",
+            &wrong,
             Some(Zeroizing::new(server.password.clone())),
             None,
             false,
@@ -1795,8 +1797,7 @@ async fn openssh_runtime_forward_persist_load_and_save_bounds() {
         assert_eq!(remove_err.persist_applied, Some(false));
         assert_eq!(remove_err.runtime_applied, Some(true));
         assert!(
-            manager
-                .snapshots()[0]
+            manager.snapshots()[0]
                 .forwards
                 .iter()
                 .any(|item| item.id == extra.id),
@@ -1949,8 +1950,9 @@ Host db
         .expect_err("encrypted key needs passphrase");
     assert_eq!(missing.code, "passphrase_required");
     let wrong = manager
-        .connect(
+        .connect_challenge_response(
             "pubkey",
+            &missing,
             None,
             Some(Zeroizing::new("not-the-passphrase".into())),
             false,
@@ -1961,8 +1963,9 @@ Host db
         .expect_err("bad decrypt");
     assert_eq!(wrong.code, "passphrase_rejected");
     let rejected = manager
-        .connect(
+        .connect_challenge_response(
             "pubkey",
+            &wrong,
             None,
             Some(Zeroizing::new(passphrase)),
             false,
@@ -1974,4 +1977,233 @@ Host db
     assert_eq!(rejected.code, "auth_failed");
     assert_ne!(rejected.code, "passphrase_rejected");
     manager.disconnect_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_resume_auth_then_session_loss_releases_listener() {
+    if !openssh_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("id_ed25519");
+    let passphrase = format!("pp-{}", token());
+    assert!(
+        Command::new("ssh-keygen")
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-f",
+                key.to_str().unwrap(),
+                "-N",
+                &passphrase,
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let server = Sshd::start("yes", true, false, Some(&dir.path().join("id_ed25519.pub")));
+    let known = dir.path().join("known_hosts");
+    std::fs::write(
+        dir.path().join("extra"),
+        format!(
+            "\
+Host db
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  IdentitiesOnly yes
+  IdentityAgent none
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+",
+            port = server.port,
+            user = server.user,
+            key = key.display(),
+            known = known.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    let listen = free_port();
+    let echo = echo_server().await;
+    let item = profile(
+        "resume-loss",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::PublicKey,
+        vec![mapping(Direction::Local, listen, echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let missing = manager
+        .connect(
+            "resume-loss",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("needs passphrase");
+    manager
+        .connect_challenge_response(
+            "resume-loss",
+            &missing,
+            None,
+            Some(Zeroizing::new(passphrase)),
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("resume should finish auth");
+    exchange(SocketAddr::from(([127, 0, 0, 1], listen)), b"up").await;
+    stop_sshd(&server);
+    let mut released = false;
+    for _ in 0..60 {
+        if port_is_free(listen) && manager.snapshots().is_empty() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(released, "resume session loss did not converge");
+}
+
+struct HubStallPrompter {
+    hub: std::sync::Arc<crate::PromptHub>,
+    profile_id: String,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl HostKeyPrompter for HubStallPrompter {
+    async fn confirm_unknown(&self, _: &HostKeyPrompt) -> bool {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = crate::model::new_id();
+        self.hub.insert(&self.profile_id, request_id.clone(), tx);
+        rx.await.unwrap_or(false)
+    }
+}
+
+#[tokio::test]
+async fn hostkey_cancel_only_affects_one_profile() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let hub = std::sync::Arc::new(crate::PromptHub::new());
+    let hub_a = std::sync::Arc::clone(&hub);
+    let hub_b = std::sync::Arc::clone(&hub);
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    let item_a = profile(
+        "host-a",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    let item_b = profile(
+        "host-b",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item_a, item_b]).unwrap();
+    let armed_a = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed_a_wait = std::sync::Arc::clone(&armed_a);
+    let armed_b_wait = std::sync::Arc::clone(&armed_b);
+    let password_a = server.password.clone();
+    let password_b = server.password.clone();
+    let mgr_a = Arc::clone(&manager);
+    let join_a = tokio::spawn(async move {
+        mgr_a
+            .connect(
+                "host-a",
+                Some(Zeroizing::new(password_a)),
+                None,
+                false,
+                false,
+                Arc::new(HubStallPrompter {
+                    hub: hub_a,
+                    profile_id: "host-a".into(),
+                    armed: armed_a_wait,
+                }),
+            )
+            .await
+    });
+    let mgr_b = Arc::clone(&manager);
+    let join_b = tokio::spawn(async move {
+        mgr_b
+            .connect(
+                "host-b",
+                Some(Zeroizing::new(password_b)),
+                None,
+                false,
+                false,
+                Arc::new(HubStallPrompter {
+                    hub: hub_b,
+                    profile_id: "host-b".into(),
+                    armed: armed_b_wait,
+                }),
+            )
+            .await
+    });
+    for _ in 0..120 {
+        if armed_a.load(std::sync::atomic::Ordering::SeqCst)
+            && armed_b.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(armed_a.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(armed_b.load(std::sync::atomic::Ordering::SeqCst));
+    hub.cancel_for("host-a");
+    manager.cancel_connect("host-a").await.unwrap();
+    let done_a = tokio::time::timeout(Duration::from_secs(2), join_a)
+        .await
+        .expect("profile a should cancel")
+        .expect("join");
+    assert!(matches!(done_a, Err(err) if err.code == "cancelled"));
+    assert!(!join_b.is_finished(), "profile b should still be waiting on host key");
+    hub.cancel_for("host-b");
+    let _ = tokio::time::timeout(Duration::from_secs(2), join_b).await;
 }

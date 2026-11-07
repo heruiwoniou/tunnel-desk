@@ -81,20 +81,28 @@ pub struct SessionSpec {
     pub forwards: Vec<ValidatedForward>,
     pub password: Option<Zeroizing<String>>,
     pub passphrase: Option<Zeroizing<String>>,
-    pub passphrases_by_host: HashMap<String, Zeroizing<String>>,
+    pub passphrases_by_endpoint: HashMap<String, Zeroizing<String>>,
+}
+
+fn endpoint_credential_key(endpoint: &Endpoint) -> String {
+    format!("{}@{}:{}", endpoint.user, endpoint.host, endpoint.port)
 }
 
 impl SessionSpec {
     fn passphrase_for(&self, endpoint: &Endpoint) -> Option<&Zeroizing<String>> {
-        self.passphrases_by_host
-            .get(&endpoint.host)
+        self.passphrases_by_endpoint
+            .get(&endpoint_credential_key(endpoint))
             .or(self.passphrase.as_ref())
     }
 
-    fn merge_passphrase(&mut self, host: &str, value: Zeroizing<String>) {
-        self.passphrases_by_host
-            .insert(host.to_string(), value.clone());
-        if self.hops.last().is_some_and(|hop| hop.host == host) {
+    fn merge_passphrase_for(&mut self, endpoint: &Endpoint, value: Zeroizing<String>) {
+        self.passphrases_by_endpoint
+            .insert(endpoint_credential_key(endpoint), value.clone());
+        if self
+            .hops
+            .last()
+            .is_some_and(|hop| endpoint_credential_key(hop) == endpoint_credential_key(endpoint))
+        {
             self.passphrase = Some(value);
         }
     }
@@ -112,6 +120,76 @@ struct PendingAuth {
     snapshot: Arc<Mutex<TunnelSnapshot>>,
     remote_rules: Arc<Mutex<Vec<RemoteRule>>>,
     cancel: CancellationToken,
+    lost: Arc<tokio::sync::Notify>,
+    challenge_id: String,
+}
+
+fn fresh_challenge_id() -> String {
+    crate::model::new_id()
+}
+
+fn auth_challenge_resumable(err: &AppError) -> bool {
+    matches!(
+        err.code.as_str(),
+        "passphrase_required"
+            | "passphrase_rejected"
+            | "password_required"
+            | "password_rejected"
+            | "auth_failed"
+    )
+}
+
+fn pending_auth_ticket(
+    spec: SessionSpec,
+    hops: Vec<Endpoint>,
+    hop_index: usize,
+    kept: Vec<client::Handle<ClientHandler>>,
+    proxies: Vec<tokio::process::Child>,
+    handle: client::Handle<ClientHandler>,
+    trust: Arc<Mutex<TrustStore>>,
+    trust_path: PathBuf,
+    snapshot: Arc<Mutex<TunnelSnapshot>>,
+    remote_rules: Arc<Mutex<Vec<RemoteRule>>>,
+    cancel: CancellationToken,
+    lost: Arc<tokio::sync::Notify>,
+) -> PendingAuth {
+    PendingAuth {
+        spec,
+        hops,
+        hop_index,
+        kept: Mutex::new(kept),
+        proxies: Mutex::new(proxies),
+        pending: Mutex::new(Some(handle)),
+        trust,
+        trust_path,
+        snapshot,
+        remote_rules,
+        cancel,
+        lost,
+        challenge_id: fresh_challenge_id(),
+    }
+}
+
+fn attach_pending_challenge(
+    mut pending: PendingAuth,
+    err: AppError,
+    endpoint: &Endpoint,
+) -> SessionFailure {
+    pending.challenge_id = fresh_challenge_id();
+    let hop = if pending.hop_index + 1 == pending.hops.len() {
+        "target"
+    } else {
+        "jump"
+    };
+    SessionFailure {
+        error: err.with_challenge_ticket(
+            &endpoint.host,
+            hop,
+            endpoint_credential_key(endpoint),
+            &pending.challenge_id,
+        ),
+        resume: Some(pending),
+    }
 }
 
 struct SessionFailure {
@@ -245,6 +323,30 @@ impl TunnelManager {
             .collect()
     }
 
+    pub async fn connect_challenge_response(
+        &self,
+        profile_id: &str,
+        ticket: &AppError,
+        password: Option<Zeroizing<String>>,
+        passphrase: Option<Zeroizing<String>>,
+        remember_password: bool,
+        remember_passphrase: bool,
+        prompter: Arc<dyn HostKeyPrompter>,
+    ) -> Result<ConnectOutcome, AppError> {
+        self.connect_with_challenge(
+            profile_id,
+            password,
+            passphrase,
+            remember_password,
+            remember_passphrase,
+            ticket.challenge_host.clone(),
+            ticket.challenge_id.clone(),
+            ticket.challenge_endpoint.clone(),
+            prompter,
+        )
+        .await
+    }
+
     pub async fn connect(
         &self,
         profile_id: &str,
@@ -261,6 +363,8 @@ impl TunnelManager {
             remember_password,
             remember_passphrase,
             None,
+            None,
+            None,
             prompter,
         )
         .await
@@ -274,6 +378,8 @@ impl TunnelManager {
         remember_password: bool,
         remember_passphrase: bool,
         challenge_host: Option<String>,
+        challenge_id: Option<String>,
+        challenge_endpoint: Option<String>,
         prompter: Arc<dyn HostKeyPrompter>,
     ) -> Result<ConnectOutcome, AppError> {
         if self
@@ -317,9 +423,6 @@ impl TunnelManager {
         let passphrase =
             self.load_passphrase(&profile, passphrase, remember_passphrase, &mut warnings)?;
         let mut spec = self.spec_for_profile(&profile, password.clone(), passphrase.clone())?;
-        if let (Some(host), Some(phrase)) = (challenge_host.as_ref(), typed_passphrase.as_ref()) {
-            spec.merge_passphrase(host, phrase.clone());
-        }
         let secret_view = secret_view(&spec);
         let trust = Arc::new(Mutex::new(self.store.load_trust()?));
         let connect_cancel = CancellationToken::new();
@@ -333,18 +436,65 @@ impl TunnelManager {
             .expect("pending")
             .remove(profile_id);
         let result = if let Some(mut pending) = pending_resume {
+            let hop = pending.hops[pending.hop_index].clone();
+            let hop_kind = if pending.hop_index + 1 == pending.hops.len() {
+                "target"
+            } else {
+                "jump"
+            };
+            let ticket = pending.challenge_id.clone();
+            let endpoint_key = endpoint_credential_key(&hop);
+            let Some(submitted) = challenge_id else {
+                self.pending_auth
+                    .lock()
+                    .expect("pending")
+                    .insert(profile_id.to_string(), pending);
+                return Err(AppError::new(
+                    "challenge_id_required",
+                    "需要最新的认证挑战编号才能继续",
+                )
+                .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket));
+            };
+            if submitted != ticket {
+                self.pending_auth
+                    .lock()
+                    .expect("pending")
+                    .insert(profile_id.to_string(), pending);
+                return Err(AppError::new(
+                    "challenge_stale",
+                    "该认证挑战已过期，请使用最新提示重试",
+                )
+                .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket));
+            }
+            if let Some(submitted_endpoint) = challenge_endpoint.as_deref() {
+                if submitted_endpoint != endpoint_key {
+                    self.pending_auth
+                        .lock()
+                        .expect("pending")
+                        .insert(profile_id.to_string(), pending);
+                    return Err(
+                        AppError::new("challenge_mismatch", "凭据与当前认证目标不匹配")
+                            .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket),
+                    );
+                }
+            }
             if let Some(value) = spec.password.clone() {
                 pending.spec.password = Some(value);
             }
-            if let Some(phrase) = spec.passphrase.clone() {
-                if let Some(host) = challenge_host.as_deref() {
-                    pending.spec.merge_passphrase(host, phrase);
-                } else if let Some(hop) = pending.hops.get(pending.hop_index) {
-                    pending.spec.merge_passphrase(&hop.host, phrase);
-                }
+            if let Some(phrase) = typed_passphrase.clone() {
+                pending.spec.merge_passphrase_for(&hop, phrase);
+            } else if let Some(phrase) = spec.passphrase.clone() {
+                pending.spec.merge_passphrase_for(&hop, phrase);
             }
             continue_pending_session(pending, prompter, connect_cancel).await
         } else {
+            if challenge_id.is_some() {
+                return Err(AppError::new(
+                    "challenge_stale",
+                    "没有进行中的认证会话可继续",
+                ));
+            }
+            let _ = challenge_host;
             start_session(
                 spec,
                 prompter,
@@ -826,7 +976,7 @@ impl TunnelManager {
             forwards,
             password,
             passphrase,
-            passphrases_by_host: HashMap::new(),
+            passphrases_by_endpoint: HashMap::new(),
         })
     }
 
@@ -1156,7 +1306,7 @@ pub async fn continue_pending_session(
     let task_done = done.clone();
     let task_snapshot = snapshot.clone();
     tokio::spawn(async move {
-        let outcome = resume_pending_auth(pending, prompter, task_cancel.clone()).await;
+        let outcome = continue_from_pending(pending, prompter, task_cancel.clone()).await;
         match outcome {
             Ok(runtime) => {
                 let runtime = Arc::new(runtime);
@@ -1412,41 +1562,164 @@ impl LiveRuntime {
     }
 }
 
-async fn resume_pending_auth(
+async fn continue_from_pending(
     mut pending: PendingAuth,
-    _prompter: Arc<dyn HostKeyPrompter>,
+    prompter: Arc<dyn HostKeyPrompter>,
     cancel: CancellationToken,
 ) -> Result<LiveRuntime, SessionFailure> {
-    let endpoint = pending.hops[pending.hop_index].clone();
+    let lost = pending.lost.clone();
+    let spec = pending.spec.clone();
+    let hops = pending.hops.clone();
+    let hop_count = hops.len();
+    let trust = pending.trust.clone();
+    let trust_path = pending.trust_path.clone();
+    let snapshot = pending.snapshot.clone();
+    let shared_remote_rules = pending.remote_rules.clone();
+    let config = Arc::new(client_config());
+    let mut kept = std::mem::take(&mut *pending.kept.lock().expect("kept"));
+    let mut proxies = std::mem::take(&mut *pending.proxies.lock().expect("proxies"));
     let mut handle = pending
         .pending
         .lock()
         .expect("pending")
         .take()
         .ok_or_else(|| AppError::new("ssh", "没有待恢复的会话"))?;
+    let mut index = pending.hop_index;
     if cancel.is_cancelled() {
-        pending.pending.lock().expect("pending").replace(handle);
+        let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+        teardown_hops(kept, proxies).await;
         return Err(AppError::new("cancelled", "连接已取消").into());
     }
-    set_phase(&pending.snapshot, Phase::Authenticating, "正在认证", None);
-    if let Err(err) = authenticate_final(&mut handle, &endpoint, &pending.spec).await {
-        pending.pending.lock().expect("pending").replace(handle);
-        return Err(SessionFailure {
-            error: err.with_challenge(&endpoint.host, "target"),
-            resume: Some(pending),
-        });
+    set_phase(&snapshot, Phase::Authenticating, "正在认证", None);
+    let endpoint = hops[index].clone();
+    let last = index + 1 == hop_count;
+    if last {
+        if let Err(err) = authenticate_final(&mut handle, &endpoint, &spec, cancel.clone()).await {
+            let pending = pending_auth_ticket(
+                spec,
+                hops,
+                index,
+                kept,
+                proxies,
+                handle,
+                trust,
+                trust_path,
+                snapshot,
+                shared_remote_rules,
+                cancel,
+                lost,
+            );
+            return Err(attach_pending_challenge(pending, err, &endpoint));
+        }
+    } else if let Err(err) =
+        authenticate_jump(&mut handle, &endpoint, spec.passphrase_for(&endpoint)).await
+    {
+        let pending = pending_auth_ticket(
+            spec,
+            hops,
+            index,
+            kept,
+            proxies,
+            handle,
+            trust,
+            trust_path,
+            snapshot,
+            shared_remote_rules,
+            cancel,
+            lost,
+        );
+        return Err(attach_pending_challenge(pending, err, &endpoint));
     }
-    let kept = std::mem::take(&mut *pending.kept.lock().expect("kept"));
-    let proxies = std::mem::take(&mut *pending.proxies.lock().expect("proxies"));
+    index += 1;
+    while index < hop_count {
+        if cancel.is_cancelled() {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            teardown_hops(kept, proxies).await;
+            return Err(AppError::new("cancelled", "连接已取消").into());
+        }
+        let hop = hops[index].clone();
+        let last = index + 1 == hop_count;
+        let handler = ClientHandler {
+            host: hop.host.clone(),
+            port: hop.port,
+            host_key_alias: hop.host_key_alias.clone(),
+            known_hosts: hop.known_hosts_files.clone(),
+            revoked_host_keys: hop.revoked_host_keys.clone(),
+            trust: trust.clone(),
+            trust_path: trust_path.clone(),
+            prompter: prompter.clone(),
+            remote_rules: if last {
+                Arc::clone(&shared_remote_rules)
+            } else {
+                Arc::new(Mutex::new(Vec::new()))
+            },
+            accept_forwards: last,
+            cancel: cancel.clone(),
+            session_lost: lost.clone(),
+            profile_id: spec.profile_id.clone(),
+        };
+        let mut next =
+            connect_hop(config.clone(), &hop, Some(&handle), handler, &mut proxies).await?;
+        if last {
+            set_phase(&snapshot, Phase::Authenticating, "正在认证", None);
+            if let Err(err) = authenticate_final(&mut next, &hop, &spec, cancel.clone()).await {
+                kept.push(handle);
+                let pending = pending_auth_ticket(
+                    spec,
+                    hops,
+                    index,
+                    kept,
+                    proxies,
+                    next,
+                    trust,
+                    trust_path,
+                    snapshot,
+                    shared_remote_rules,
+                    cancel,
+                    lost,
+                );
+                return Err(attach_pending_challenge(pending, err, &hop));
+            }
+        } else if let Err(err) = authenticate_jump(&mut next, &hop, spec.passphrase_for(&hop)).await
+        {
+            if auth_challenge_resumable(&err) {
+                kept.push(handle);
+                let pending = pending_auth_ticket(
+                    spec,
+                    hops,
+                    index,
+                    kept,
+                    proxies,
+                    next,
+                    trust,
+                    trust_path,
+                    snapshot,
+                    shared_remote_rules,
+                    cancel,
+                    lost,
+                );
+                return Err(attach_pending_challenge(pending, err, &hop));
+            }
+            let _ = next.disconnect(Disconnect::ByApplication, "", "en").await;
+            teardown_hops(kept, proxies).await;
+            return Err(SessionFailure {
+                error: err,
+                resume: None,
+            });
+        }
+        kept.push(handle);
+        handle = next;
+        index += 1;
+    }
     assemble_live_runtime(
         handle,
         kept,
         proxies,
-        &pending.spec,
-        pending.remote_rules,
-        pending.snapshot,
+        &spec,
+        shared_remote_rules,
+        snapshot,
         cancel,
-        Arc::new(tokio::sync::Notify::new()),
+        lost,
     )
     .await
 }
@@ -1625,6 +1898,7 @@ async fn run_session(
             accept_forwards: last,
             cancel: cancel.clone(),
             session_lost: lost.clone(),
+            profile_id: spec.profile_id.clone(),
         };
         let mut handle = connect_hop(
             config.clone(),
@@ -1636,27 +1910,44 @@ async fn run_session(
         .await?;
         if last {
             set_phase(&snapshot, Phase::Authenticating, "正在认证", None);
-            if let Err(err) = authenticate_final(&mut handle, endpoint, &spec).await {
-                return Err(SessionFailure {
-                    error: err.with_challenge(&endpoint.host, "target"),
-                    resume: Some(PendingAuth {
-                        spec: spec.clone(),
-                        hops: spec.hops.clone(),
-                        hop_index: index,
-                        kept: Mutex::new(kept),
-                        proxies: Mutex::new(proxies),
-                        pending: Mutex::new(Some(handle)),
-                        trust,
-                        trust_path,
-                        snapshot,
-                        remote_rules: shared_remote_rules,
-                        cancel,
-                    }),
-                });
+            if let Err(err) = authenticate_final(&mut handle, endpoint, &spec, cancel.clone()).await
+            {
+                let pending = pending_auth_ticket(
+                    spec.clone(),
+                    spec.hops.clone(),
+                    index,
+                    kept,
+                    proxies,
+                    handle,
+                    trust,
+                    trust_path,
+                    snapshot,
+                    shared_remote_rules,
+                    cancel,
+                    lost.clone(),
+                );
+                return Err(attach_pending_challenge(pending, err, endpoint));
             }
         } else if let Err(err) =
             authenticate_jump(&mut handle, endpoint, spec.passphrase_for(endpoint)).await
         {
+            if auth_challenge_resumable(&err) {
+                let pending = pending_auth_ticket(
+                    spec.clone(),
+                    spec.hops.clone(),
+                    index,
+                    kept,
+                    proxies,
+                    handle,
+                    trust,
+                    trust_path,
+                    snapshot,
+                    shared_remote_rules,
+                    cancel,
+                    lost.clone(),
+                );
+                return Err(attach_pending_challenge(pending, err, endpoint));
+            }
             let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
             teardown_hops(kept, proxies).await;
             return Err(SessionFailure {
@@ -1855,6 +2146,7 @@ struct ClientHandler {
     accept_forwards: bool,
     cancel: CancellationToken,
     session_lost: Arc<tokio::sync::Notify>,
+    profile_id: String,
 }
 
 impl Handler for ClientHandler {
@@ -2028,6 +2320,7 @@ async fn authenticate_final(
     handle: &mut client::Handle<ClientHandler>,
     endpoint: &Endpoint,
     spec: &SessionSpec,
+    cancel: CancellationToken,
 ) -> Result<(), AppError> {
     let configured = if endpoint.preferred.is_empty() {
         vec![
@@ -2125,12 +2418,17 @@ async fn authenticate_final(
                 let Some(password) = spec.password.as_ref() else {
                     continue;
                 };
+                if cancel.is_cancelled() {
+                    return Err(AppError::new("cancelled", "连接已取消"));
+                }
                 password_rejected = true;
-                if method == "password" && try_password(handle, &endpoint.user, password).await? {
+                if method == "password"
+                    && try_password(handle, &endpoint.user, password, cancel.clone()).await?
+                {
                     return Ok(());
                 }
                 if method == "keyboard-interactive"
-                    && try_keyboard(handle, &endpoint.user, password).await?
+                    && try_keyboard(handle, &endpoint.user, password, cancel.clone()).await?
                 {
                     return Ok(());
                 }
@@ -2282,10 +2580,14 @@ async fn try_password(
     handle: &mut client::Handle<ClientHandler>,
     user: &str,
     password: &Zeroizing<String>,
+    cancel: CancellationToken,
 ) -> Result<bool, AppError> {
-    let result = handle
-        .authenticate_password(user, password.as_str())
-        .await?;
+    let attempt = handle.authenticate_password(user, password.as_str());
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AppError::new("cancelled", "连接已取消")),
+        result = attempt => result?,
+    };
     Ok(result.success())
 }
 
@@ -2293,11 +2595,17 @@ async fn try_keyboard(
     handle: &mut client::Handle<ClientHandler>,
     user: &str,
     password: &Zeroizing<String>,
+    cancel: CancellationToken,
 ) -> Result<bool, AppError> {
-    let mut response = handle
-        .authenticate_keyboard_interactive_start(user, None::<String>)
-        .await?;
+    let mut response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AppError::new("cancelled", "连接已取消")),
+        result = handle.authenticate_keyboard_interactive_start(user, None::<String>) => result?,
+    };
     for _ in 0..4 {
+        if cancel.is_cancelled() {
+            return Err(AppError::new("cancelled", "连接已取消"));
+        }
         match response {
             client::KeyboardInteractiveAuthResponse::Success => return Ok(true),
             client::KeyboardInteractiveAuthResponse::Failure { .. } => return Ok(false),
@@ -2306,9 +2614,11 @@ async fn try_keyboard(
                     .iter()
                     .map(|_| password.as_str().to_string())
                     .collect();
-                response = handle
-                    .authenticate_keyboard_interactive_respond(answers)
-                    .await?;
+                response = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(AppError::new("cancelled", "连接已取消")),
+                    result = handle.authenticate_keyboard_interactive_respond(answers) => result?,
+                };
             }
         }
     }

@@ -100,6 +100,8 @@ struct TestServer {
     password: String,
     refuse_forward: bool,
     refuse_cancel_forward: bool,
+    auth_hold: Option<Arc<tokio::sync::Notify>>,
+    auth_delay: Duration,
     forwards: Arc<Mutex<std::collections::HashMap<u16, CancellationToken>>>,
 }
 
@@ -114,6 +116,10 @@ impl Handler for TestServer {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if let Some(hold) = &self.auth_hold {
+            hold.notify_one();
+            tokio::time::sleep(self.auth_delay).await;
+        }
         if user == self.user && password.as_bytes() == self.password.as_bytes() {
             Ok(Auth::Accept)
         } else {
@@ -347,6 +353,23 @@ async fn ssh_server_opts(
     refuse_forward: bool,
     refuse_cancel_forward: bool,
 ) -> SocketAddr {
+    ssh_server_delayed(
+        password,
+        refuse_forward,
+        refuse_cancel_forward,
+        None,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn ssh_server_delayed(
+    password: String,
+    refuse_forward: bool,
+    refuse_cancel_forward: bool,
+    auth_hold: Option<Arc<tokio::sync::Notify>>,
+    auth_delay: Duration,
+) -> SocketAddr {
     let mut config = russh::server::Config::default();
     config.auth_rejection_time = Duration::from_millis(1);
     config.auth_rejection_time_initial = Some(Duration::from_millis(1));
@@ -366,6 +389,8 @@ async fn ssh_server_opts(
         password,
         refuse_forward,
         refuse_cancel_forward,
+        auth_hold,
+        auth_delay,
         forwards: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     tokio::spawn(async move {
@@ -588,6 +613,7 @@ async fn rejects_bad_password_changed_key_occupied_port_and_forward_refusal() {
     )
     .await;
     assert_eq!(wrong.unwrap_err().code, "password_rejected");
+    manager.cancel_connect("bad").await.unwrap();
     TcpListener::bind(("127.0.0.1", local_port))
         .await
         .expect("failed auth left no listener");
@@ -673,4 +699,61 @@ async fn remote_forward_remove_reports_cancel_failure_and_keeps_mapping() {
     )
     .await;
     manager.disconnect("remote-cancel").await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_during_slow_password_auth_converges_quickly() {
+    let secret = fake_secret();
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let ssh = ssh_server_delayed(
+        secret.clone(),
+        false,
+        false,
+        Some(Arc::clone(&hold)),
+        Duration::from_secs(30),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    ));
+    let item = profile(
+        "slow-auth",
+        ssh.port(),
+        vec![mapping(
+            Direction::Local,
+            free_port(),
+            echo_server().await.port(),
+        )],
+        false,
+    );
+    let need = save_and_connect(&manager, &item, None, false, Arc::new(FixedPrompter(true)))
+        .await
+        .expect_err("password required");
+    assert_eq!(need.code, "password_required");
+    let mgr = Arc::clone(&manager);
+    let join = tokio::spawn(async move {
+        mgr.connect_challenge_response(
+            "slow-auth",
+            &need,
+            Some(Zeroizing::new(secret.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+    });
+    hold.notified().await;
+    manager.cancel_connect("slow-auth").await.unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(3), join).await;
+    let outcome = finished
+        .expect("cancel should finish promptly")
+        .expect("join");
+    assert!(matches!(outcome, Err(err) if err.code == "cancelled"));
+    assert!(manager.snapshots().is_empty());
 }

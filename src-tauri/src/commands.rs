@@ -17,6 +17,8 @@ struct ConnectRequest {
     remember_server_password: bool,
     remember_key_passphrase: bool,
     challenge_host: Option<String>,
+    challenge_id: Option<String>,
+    challenge_endpoint: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -39,6 +41,7 @@ struct HostKeyEvent {
 struct GuiPrompter {
     app: AppHandle,
     hub: Arc<crate::PromptHub>,
+    profile_id: String,
 }
 
 #[async_trait::async_trait]
@@ -46,7 +49,7 @@ impl HostKeyPrompter for GuiPrompter {
     async fn confirm_unknown(&self, prompt: &HostKeyPrompt) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request_id = crate::model::new_id();
-        self.hub.insert(request_id.clone(), tx);
+        self.hub.insert(&self.profile_id, request_id.clone(), tx);
         let _ = self.app.emit(
             "hostkey-required",
             HostKeyEvent {
@@ -75,10 +78,11 @@ fn seal(value: Option<String>) -> Option<Zeroizing<String>> {
     })
 }
 
-fn prompter(app: &AppHandle, state: &AppState) -> Arc<GuiPrompter> {
+fn prompter(app: &AppHandle, state: &AppState, profile_id: &str) -> Arc<GuiPrompter> {
     Arc::new(GuiPrompter {
         app: app.clone(),
         hub: state.prompts.clone(),
+        profile_id: profile_id.to_string(),
     })
 }
 
@@ -221,7 +225,7 @@ async fn connect_profile(
     request: ConnectRequest,
 ) -> Result<ConnectOutcome, AppError> {
     let manager = state.manager.clone();
-    let prompter = prompter(&app, &state);
+    let prompter = prompter(&app, &state, &request.profile_id);
     let outcome = manager
         .connect_with_challenge(
             &request.profile_id,
@@ -230,6 +234,8 @@ async fn connect_profile(
             request.remember_server_password,
             request.remember_key_passphrase,
             request.challenge_host,
+            request.challenge_id,
+            request.challenge_endpoint,
             prompter,
         )
         .await?;
@@ -338,7 +344,7 @@ async fn cancel_connect(
     state: State<'_, AppState>,
     profile_id: String,
 ) -> Result<(), AppError> {
-    state.prompts.cancel_all();
+    state.prompts.cancel_for(&profile_id);
     state.manager.cancel_connect(&profile_id).await?;
     let _ = app.emit("tunnel-state", state.manager.snapshots());
     Ok(())
@@ -353,6 +359,7 @@ pub async fn connect_from_tray(
     let prompter = Arc::new(GuiPrompter {
         app: app.clone(),
         hub: prompts.clone(),
+        profile_id: profile_id.to_string(),
     });
     match manager
         .connect(profile_id, None, None, false, false, prompter)
@@ -376,6 +383,8 @@ pub async fn connect_from_tray(
                     "message": err.message,
                     "challengeHost": err.challenge_host,
                     "challengeHop": err.challenge_hop,
+                    "challengeId": err.challenge_id,
+                    "challengeEndpoint": err.challenge_endpoint,
                 }),
             );
         }

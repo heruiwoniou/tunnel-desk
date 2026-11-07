@@ -30,6 +30,8 @@ export function asAppError(error: unknown): AppErrorBody {
         message: record.message,
         challengeHost: record.challengeHost ?? null,
         challengeHop: record.challengeHop ?? null,
+        challengeId: record.challengeId ?? null,
+        challengeEndpoint: record.challengeEndpoint ?? null,
         runtimeApplied: record.runtimeApplied ?? null,
         persistApplied: record.persistApplied ?? null,
       }
@@ -182,6 +184,8 @@ export function onNeedsInput(
     message: string
     challengeHost?: string | null
     challengeHop?: string | null
+    challengeId?: string | null
+    challengeEndpoint?: string | null
   }) => void,
 ) {
   return listen<{ profileId: string; code: string; message: string }>("connect-needs-input", (event) => handler(event.payload))

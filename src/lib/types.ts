@@ -139,6 +139,8 @@ export type AppErrorBody = {
   message: string
   challengeHost?: string | null
   challengeHop?: string | null
+  challengeId?: string | null
+  challengeEndpoint?: string | null
   runtimeApplied?: boolean | null
   persistApplied?: boolean | null
 }
@@ -150,6 +152,8 @@ export type ConnectRequest = {
   rememberServerPassword: boolean
   rememberKeyPassphrase: boolean
   challengeHost?: string | null
+  challengeId?: string | null
+  challengeEndpoint?: string | null
 }
 
 export type HostKeyEvent = {

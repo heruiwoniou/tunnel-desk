@@ -15,6 +15,8 @@ export type AuthChallengeContext = {
   message: string
   challengeHost?: string | null
   challengeHop?: "jump" | "target" | string | null
+  challengeId?: string | null
+  challengeEndpoint?: string | null
 }
 
 export function isAuthChallengeCode(code: string): code is AuthChallengeCode {
@@ -47,7 +49,22 @@ export function connectRequestFromChallenge(
     rememberServerPassword: secrets.rememberServerPassword ?? false,
     rememberKeyPassphrase: secrets.rememberKeyPassphrase ?? false,
     challengeHost: challenge.challengeHost ?? null,
+    challengeId: challenge.challengeId ?? null,
+    challengeEndpoint: challenge.challengeEndpoint ?? null,
   }
+}
+
+export function isStaleChallengeSubmission(
+  active: AuthChallengeContext,
+  submitted: Pick<ConnectRequest, "challengeId" | "challengeEndpoint">,
+): boolean {
+  if (active.challengeId && submitted.challengeId !== active.challengeId) {
+    return true
+  }
+  if (active.challengeEndpoint && submitted.challengeEndpoint !== active.challengeEndpoint) {
+    return true
+  }
+  return false
 }
 
 export function challengeHopLabel(hop: string | null | undefined, language: Language): string | null {
@@ -83,5 +100,7 @@ export function mergeAuthChallenge(error: AppErrorBody, profileId: string): Auth
     message: error.message,
     challengeHost: error.challengeHost ?? null,
     challengeHop: error.challengeHop ?? null,
+    challengeId: error.challengeId ?? null,
+    challengeEndpoint: error.challengeEndpoint ?? null,
   }
 }

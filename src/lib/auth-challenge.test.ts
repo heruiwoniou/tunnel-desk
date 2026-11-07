@@ -5,6 +5,7 @@ import {
   challengeScopeLine,
   connectRequestFromChallenge,
   isAuthChallengeCode,
+  isStaleChallengeSubmission,
   mergeAuthChallenge,
 } from "@/lib/auth-challenge"
 import type { AppErrorBody } from "@/lib/types"
@@ -21,6 +22,21 @@ describe("auth challenge routing", () => {
     expect(challengeFields("passphrase_rejected")).toEqual({ needPassword: false, needPassphrase: true })
   })
 
+  it("rejects mismatched challenge tickets", () => {
+    expect(
+      isStaleChallengeSubmission(
+        {
+          profileId: "p1",
+          code: "passphrase_required",
+          message: "",
+          challengeId: "a",
+          challengeEndpoint: "u@h:22",
+        },
+        { challengeId: "b", challengeEndpoint: "u@h:22" },
+      ),
+    ).toBe(true)
+  })
+
   it("binds challenge host for per-hop resume without reusing other secrets", () => {
     const request = connectRequestFromChallenge(
       {
@@ -29,12 +45,15 @@ describe("auth challenge routing", () => {
         message: "needs key",
         challengeHost: "jump.internal",
         challengeHop: "jump",
+        challengeId: "ticket-1",
+        challengeEndpoint: "ops@jump.internal:22",
       },
       { keyPassphrase: "hop-only", rememberKeyPassphrase: true },
     )
     expect(request.serverPassword).toBeNull()
     expect(request.keyPassphrase).toBe("hop-only")
     expect(request.challengeHost).toBe("jump.internal")
+    expect(request.challengeId).toBe("ticket-1")
   })
 
   it("maps invoke errors into dialog state", () => {
