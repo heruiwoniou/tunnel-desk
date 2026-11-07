@@ -25,6 +25,17 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own error instead of asking for the server password. SHA-1 certificate
   signatures stay disabled.
 
+### Fixed
+
+- `RevokedHostKeys` is read as one OpenSSH public key per line. A listed host
+  key, certificate subject, or signing CA is rejected even when `known_hosts`
+  would otherwise trust it. A KRL or a line that is not a public key fails
+  closed. Key revocation lists are still not parsed.
+- An unlocked agent signing key is used for a configured certificate before
+  the matching encrypted `IdentityFile`. Agent-only and automatic connections
+  do not ask for that passphrase. `IdentityAgent none` and public-key-only
+  mode still use the file.
+
 ## [0.1.0] - 2026-11-07
 
 ### Added

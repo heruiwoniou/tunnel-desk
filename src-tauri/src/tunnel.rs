@@ -1303,6 +1303,7 @@ async fn authenticate_final(
                 {
                     FileAttempt::Success => return Ok(()),
                     FileAttempt::NeedsPassphrase => saw_encrypted_key = true,
+                    FileAttempt::Rejected => {}
                     FileAttempt::Failed { notes: found } => notes.extend(found),
                 }
             }
@@ -1317,6 +1318,15 @@ async fn authenticate_final(
                 {
                     FileAttempt::Success => return Ok(()),
                     FileAttempt::NeedsPassphrase => saw_encrypted_key = true,
+                    FileAttempt::Rejected => {
+                        return auth_failure(
+                            saw_encrypted_key,
+                            spec.passphrase.is_none(),
+                            false,
+                            &notes,
+                            None,
+                        );
+                    }
                     FileAttempt::Failed { notes: found } => {
                         notes.extend(found);
                         return auth_failure(
@@ -1342,6 +1352,7 @@ async fn authenticate_final(
                     FileAttempt::NeedsPassphrase => {
                         return Err(AppError::new("passphrase_required", "私钥已加密，需要口令"));
                     }
+                    FileAttempt::Rejected => {}
                     FileAttempt::Failed { notes: found } => notes.extend(found),
                 }
             }
@@ -1442,6 +1453,13 @@ async fn authenticate_jump(
     }
     match try_publickey(handle, endpoint, passphrase, PublicKeyFilter::Any).await? {
         FileAttempt::Success => Ok(()),
+        FileAttempt::Rejected => Err(AppError::new(
+            "jump_auth_failed",
+            format!(
+                "无法认证跳板 {}。跳板需要 agent 或密钥，不使用目标服务器密码。",
+                endpoint.host
+            ),
+        )),
         FileAttempt::NeedsPassphrase => Err(AppError::new(
             "jump_auth_failed",
             format!(
@@ -1516,7 +1534,11 @@ enum PublicKeyFilter {
 enum FileAttempt {
     Success,
     NeedsPassphrase,
-    Failed { notes: Vec<identity::PlanNote> },
+    /// A signature was produced and the server rejected it.
+    Rejected,
+    Failed {
+        notes: Vec<identity::PlanNote>,
+    },
 }
 
 async fn try_publickey(
@@ -1585,15 +1607,33 @@ where
         identity::unix_now(),
     );
     let mut needs_passphrase = false;
+    let mut rejected_certs = Vec::new();
     for offer in &plan.offers {
         match filter {
             PublicKeyFilter::AgentOnly if !matches!(offer.source, KeySource::Agent(_)) => continue,
             PublicKeyFilter::FilesOnly if !matches!(offer.source, KeySource::File(_)) => continue,
             _ => {}
         }
+        if matches!(offer.source, KeySource::File(_))
+            && offer.certificate.as_ref().is_some_and(|cert| {
+                cert.to_bytes()
+                    .ok()
+                    .is_some_and(|bytes| rejected_certs.iter().any(|seen| seen == &bytes))
+            })
+        {
+            continue;
+        }
         match execute_offer(handle, endpoint, offer, passphrase, agent, &identities).await? {
             FileAttempt::Success => return Ok(FileAttempt::Success),
             FileAttempt::NeedsPassphrase => needs_passphrase = true,
+            FileAttempt::Rejected => {
+                if matches!(offer.source, KeySource::Agent(_))
+                    && let Some(cert) = &offer.certificate
+                    && let Ok(bytes) = cert.to_bytes()
+                {
+                    rejected_certs.push(bytes);
+                }
+            }
             FileAttempt::Failed { .. } => {}
         }
     }
@@ -1679,7 +1719,7 @@ where
             if result.success() {
                 Ok(FileAttempt::Success)
             } else {
-                Ok(FileAttempt::Failed { notes: Vec::new() })
+                Ok(FileAttempt::Rejected)
             }
         }
         KeySource::Agent(index) => {
@@ -1724,7 +1764,8 @@ where
             };
             match result {
                 Ok(result) if result.success() => Ok(FileAttempt::Success),
-                _ => Ok(FileAttempt::Failed { notes: Vec::new() }),
+                Ok(_) => Ok(FileAttempt::Rejected),
+                Err(_) => Ok(FileAttempt::Failed { notes: Vec::new() }),
             }
         }
     }

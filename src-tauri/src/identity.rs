@@ -357,23 +357,30 @@ fn push_certificate_offer(
     if cert_bytes(cert).is_some_and(|bytes| used_certs.iter().any(|seen| seen == &bytes)) {
         return;
     }
-    match find_signer(cert, &loaded.path, identities, agent_keys) {
-        SignerMatch::Found(source) => {
-            if let KeySource::Agent(index) = &source {
-                agent_plain_used.push(*index);
+    match find_signers(cert, &loaded.path, identities, agent_keys) {
+        SignerMatch::Found(sources) => {
+            if sources.is_empty() {
+                return;
             }
             if let Some(bytes) = cert_bytes(cert) {
                 used_certs.push(bytes);
             }
-            let label = match &source {
-                KeySource::File(path) => format!("{} ({})", loaded.path.display(), path.display()),
-                KeySource::Agent(_) => format!("{} (agent)", loaded.path.display()),
-            };
-            offers.push(AuthOffer {
-                certificate: Some(cert.clone()),
-                source,
-                label,
-            });
+            for source in sources {
+                if let KeySource::Agent(index) = &source {
+                    agent_plain_used.push(*index);
+                }
+                let label = match &source {
+                    KeySource::File(path) => {
+                        format!("{} ({})", loaded.path.display(), path.display())
+                    }
+                    KeySource::Agent(_) => format!("{} (agent)", loaded.path.display()),
+                };
+                offers.push(AuthOffer {
+                    certificate: Some(cert.clone()),
+                    source,
+                    label,
+                });
+            }
         }
         SignerMatch::Mismatch { identity } => notes.push(PlanNote {
             code: "certificate_key_mismatch",
@@ -394,17 +401,30 @@ fn push_certificate_offer(
 }
 
 enum SignerMatch {
-    Found(KeySource),
+    Found(Vec<KeySource>),
     Mismatch { identity: PathBuf },
     Missing,
 }
 
-fn find_signer(
+/// Agent identities come before the on-disk private file. OpenSSH offers an
+/// unlocked agent key even when the same `IdentityFile` is still present and
+/// encrypted. A filename match whose public key differs is a mismatch only
+/// when no agent identity can sign the certificate.
+fn find_signers(
     cert: &Certificate,
     cert_path: &Path,
     identities: &[LoadedIdentity],
     agent_keys: &[ListedAgentKey],
 ) -> SignerMatch {
+    let agent_index = agent_keys.iter().position(|agent| {
+        let agent_data = agent
+            .certificate
+            .as_ref()
+            .map(|item| item.public_key())
+            .unwrap_or_else(|| agent.public_key.key_data());
+        same_key_data(agent_data, cert.public_key())
+    });
+    let mut file = None;
     let mut mismatch = None;
     for identity in identities {
         if private_key_readable(&identity.path)
@@ -413,32 +433,36 @@ fn find_signer(
                 .as_ref()
                 .is_some_and(|public| same_key_data(public.key_data(), cert.public_key()))
         {
-            return SignerMatch::Found(KeySource::File(identity.path.clone()));
+            file = Some(identity.path.clone());
+            break;
         }
     }
-    for identity in identities {
-        if !filename_matches(cert_path, &identity.path) {
-            continue;
-        }
-        match &identity.public_key {
-            Some(public) if !same_key_data(public.key_data(), cert.public_key()) => {
-                mismatch = Some(identity.path.clone());
+    if file.is_none() {
+        for identity in identities {
+            if !filename_matches(cert_path, &identity.path) {
+                continue;
             }
-            _ if private_key_readable(&identity.path) => {
-                return SignerMatch::Found(KeySource::File(identity.path.clone()));
+            match &identity.public_key {
+                Some(public) if !same_key_data(public.key_data(), cert.public_key()) => {
+                    mismatch = Some(identity.path.clone());
+                }
+                _ if private_key_readable(&identity.path) => {
+                    file = Some(identity.path.clone());
+                    break;
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
-    for (index, agent) in agent_keys.iter().enumerate() {
-        let agent_data = agent
-            .certificate
-            .as_ref()
-            .map(|item| item.public_key())
-            .unwrap_or_else(|| agent.public_key.key_data());
-        if same_key_data(agent_data, cert.public_key()) {
-            return SignerMatch::Found(KeySource::Agent(index));
-        }
+    let mut sources = Vec::new();
+    if let Some(index) = agent_index {
+        sources.push(KeySource::Agent(index));
+    }
+    if let Some(path) = file {
+        sources.push(KeySource::File(path));
+    }
+    if !sources.is_empty() {
+        return SignerMatch::Found(sources);
     }
     if let Some(identity) = mismatch {
         SignerMatch::Mismatch { identity }
@@ -914,6 +938,108 @@ mod tests {
                 .iter()
                 .all(|offer| !offer.label.contains("extra"))
         );
+    }
+
+    #[test]
+    fn unlocked_agent_key_signs_before_the_local_private_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = key(Algorithm::Ed25519);
+        let user = key(Algorithm::Ed25519);
+        let other = key(Algorithm::Ed25519);
+        let stamp = now();
+        let cert = sign(
+            &ca,
+            &user,
+            CertType::User,
+            Some("ops"),
+            stamp.saturating_sub(60),
+            stamp + 3600,
+            None,
+        );
+        let identity = dir.path().join("id_ed25519");
+        write_private(&identity, &user);
+        let cert_path = dir.path().join("id_ed25519-cert.pub");
+        write_cert(&cert_path, &cert);
+        let agent = vec![ListedAgentKey {
+            public_key: user.public_key().clone(),
+            certificate: None,
+            comment: "plain".into(),
+        }];
+        let plan = plan_authentication(
+            &[identity.display().to_string()],
+            &[cert_path.display().to_string()],
+            true,
+            true,
+            &agent,
+            stamp,
+        );
+        assert!(plan.offers.len() >= 2, "{:?}", plan.offers);
+        assert!(plan.offers[0].certificate.is_some());
+        assert!(matches!(plan.offers[0].source, KeySource::Agent(0)));
+        assert!(matches!(plan.offers[1].source, KeySource::File(_)));
+        assert!(plan.offers[1].certificate.is_some());
+
+        let unrelated = vec![ListedAgentKey {
+            public_key: other.public_key().clone(),
+            certificate: None,
+            comment: "other".into(),
+        }];
+        let blocked = plan_authentication(
+            &[identity.display().to_string()],
+            &[cert_path.display().to_string()],
+            true,
+            true,
+            &unrelated,
+            stamp,
+        );
+        assert!(
+            blocked
+                .offers
+                .iter()
+                .any(|offer| matches!(offer.source, KeySource::File(_)))
+        );
+        assert!(
+            blocked
+                .offers
+                .iter()
+                .all(|offer| !matches!(offer.source, KeySource::Agent(_)))
+        );
+
+        write_private(&identity, &other);
+        let mismatch = plan_authentication(
+            &[identity.display().to_string()],
+            &[cert_path.display().to_string()],
+            true,
+            true,
+            &unrelated,
+            stamp,
+        );
+        assert!(
+            mismatch
+                .offers
+                .iter()
+                .all(|offer| offer.certificate.is_none())
+        );
+        assert!(
+            mismatch
+                .notes
+                .iter()
+                .any(|note| note.code == "certificate_key_mismatch")
+        );
+        let none = plan_authentication(
+            &[identity.display().to_string()],
+            &[cert_path.display().to_string()],
+            true,
+            true,
+            &[],
+            stamp,
+        );
+        assert!(
+            none.notes
+                .iter()
+                .any(|note| note.code == "certificate_key_mismatch")
+        );
+        assert!(none.offers.iter().all(|offer| offer.certificate.is_none()));
     }
 
     #[test]

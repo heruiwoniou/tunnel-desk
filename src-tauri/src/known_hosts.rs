@@ -338,6 +338,10 @@ pub enum HostDecision {
 /// `HostKeyAlias` when it is set. An empty principal list matches any name.
 /// Revocation is final. Any other certificate failure falls back to the raw
 /// key inside the certificate, which is the OpenSSH downgrade path.
+/// `RevokedHostKeys` is a list of public keys, one per line, not a
+/// `known_hosts` file. A listed key revokes that public key and, for a host
+/// certificate, its certified key or signing CA. `@revoked` in `known_hosts`
+/// stays host-scoped. A KRL is rejected rather than parsed.
 pub fn decide_host_key(
     known_hosts: &[PathBuf],
     revoked_files: &[PathBuf],
@@ -564,14 +568,76 @@ fn read_revocation_file(path: &Path) -> Result<Vec<HostRecord>, AppError> {
         ));
     }
     let text = String::from_utf8_lossy(&bytes);
-    let mut records = read_host_text(&text, &path.display().to_string())?;
-    for record in &mut records {
-        record.revocation_file = true;
-        if record.marker.is_none() {
-            record.marker = Some(Marker::Revoked);
+    let mut records = Vec::new();
+    for (line_no, raw) in text.lines().enumerate() {
+        let source = format!("{}:{}", path.display(), line_no + 1);
+        match parse_revoked_public_key(raw, &source)? {
+            None => {}
+            Some(key) => {
+                let key_line = key.to_openssh().map_err(|_| {
+                    AppError::new(
+                        "revoked_host_keys",
+                        format!("吊销文件 {source} 的公钥无法编码，连接已拒绝"),
+                    )
+                })?;
+                records.push(HostRecord {
+                    marker: Some(Marker::Revoked),
+                    hosts: "*".into(),
+                    key_line,
+                    source,
+                    revocation_file: true,
+                });
+            }
         }
     }
     Ok(records)
+}
+
+/// OpenSSH `RevokedHostKeys` text form: one public key per line, optional
+/// comment, blank lines and `#` comments ignored. A type name with no key
+/// material is skipped (`SSH_ERR_KEY_LENGTH`). Any other line fails the
+/// connection. Host patterns are not part of this format.
+fn parse_revoked_public_key(line: &str, source: &str) -> Result<Option<PublicKey>, AppError> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return Ok(None);
+    }
+    if let Ok(cert) = Certificate::from_openssh(trimmed) {
+        return Ok(Some(PublicKey::new(cert.public_key().clone(), "")));
+    }
+    if let Ok(key) = PublicKey::from_openssh(trimmed) {
+        return Ok(Some(key));
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let kind = tokens.next().unwrap_or("");
+    if tokens.next().is_none() && is_public_key_type_name(kind) {
+        return Ok(None);
+    }
+    Err(AppError::new(
+        "revoked_host_keys",
+        format!("吊销文件 {source} 不是一行一把 OpenSSH 公钥，连接已拒绝"),
+    ))
+}
+
+fn is_public_key_type_name(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "ssh-dss"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+            | "ssh-ed25519-cert-v01@openssh.com"
+            | "ssh-rsa-cert-v01@openssh.com"
+            | "rsa-sha2-256-cert-v01@openssh.com"
+            | "rsa-sha2-512-cert-v01@openssh.com"
+            | "ecdsa-sha2-nistp256-cert-v01@openssh.com"
+            | "ecdsa-sha2-nistp384-cert-v01@openssh.com"
+            | "ecdsa-sha2-nistp521-cert-v01@openssh.com"
+    ) || kind.ends_with("-cert-v01@openssh.com")
 }
 
 fn read_host_records(path: &Path) -> Result<Vec<HostRecord>, AppError> {
@@ -818,5 +884,175 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(alias, HostDecision::Accept));
+    }
+
+    #[test]
+    fn revoked_host_keys_file_lists_public_keys_not_host_patterns() {
+        let ca = key();
+        let host_key = key();
+        let other = key();
+        let rsa = PrivateKey::random(
+            &mut rng(),
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256),
+            },
+        )
+        .unwrap();
+        let cert = signed(&ca, &host_key, Some("127.0.0.1"));
+        let dir = tempfile::tempdir().unwrap();
+        let known = dir.path().join("known_hosts");
+        std::fs::write(
+            &known,
+            format!(
+                "@cert-authority 127.0.0.1 {}\n127.0.0.1 {}",
+                ca.public_key().to_openssh().unwrap(),
+                host_key.public_key().to_openssh().unwrap()
+            ),
+        )
+        .unwrap();
+        let revoked = dir.path().join("revoked");
+        let host_line = host_key.public_key().to_openssh().unwrap();
+        let rsa_line = rsa.public_key().to_openssh().unwrap();
+        std::fs::write(
+            &revoked,
+            format!(
+                "\n# comment\nssh-ed25519\n{host_line} retired host\n\n{rsa_line} unused rsa\n"
+            ),
+        )
+        .unwrap();
+        let decision = decide_host_key(
+            &[known.clone()],
+            &[revoked.clone()],
+            &TrustStore::default(),
+            "127.0.0.1",
+            22,
+            None,
+            &present(cert.clone()),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                decision,
+                HostDecision::Reject {
+                    code: "host_cert_revoked",
+                    ..
+                }
+            ),
+            "a plain public-key revocation must beat CA trust: {decision:?}"
+        );
+        let raw = decide_host_key(
+            &[known.clone()],
+            &[revoked.clone()],
+            &TrustStore::default(),
+            "127.0.0.1",
+            22,
+            None,
+            &PublicKeyOrCertificate::from(host_key.public_key().clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            raw,
+            HostDecision::Reject {
+                code: "host_key_revoked",
+                ..
+            }
+        ));
+
+        let ca_only = dir.path().join("revoked-ca");
+        std::fs::write(
+            &ca_only,
+            format!(
+                "{} signing authority\n",
+                ca.public_key().to_openssh().unwrap()
+            ),
+        )
+        .unwrap();
+        let by_ca = decide_host_key(
+            &[known.clone()],
+            &[ca_only],
+            &TrustStore::default(),
+            "127.0.0.1",
+            22,
+            None,
+            &present(cert.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            by_ca,
+            HostDecision::Reject {
+                code: "host_cert_revoked",
+                ..
+            }
+        ));
+
+        let cert_only = dir.path().join("revoked-cert");
+        std::fs::write(&cert_only, cert.to_openssh().unwrap()).unwrap();
+        let by_cert = decide_host_key(
+            &[known.clone()],
+            &[cert_only],
+            &TrustStore::default(),
+            "127.0.0.1",
+            22,
+            None,
+            &present(cert.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            by_cert,
+            HostDecision::Reject {
+                code: "host_cert_revoked",
+                ..
+            }
+        ));
+
+        let unrelated = dir.path().join("revoked-other");
+        std::fs::write(
+            &unrelated,
+            format!("{}\n", other.public_key().to_openssh().unwrap()),
+        )
+        .unwrap();
+        assert!(matches!(
+            decide_host_key(
+                &[known.clone()],
+                &[unrelated],
+                &TrustStore::default(),
+                "127.0.0.1",
+                22,
+                None,
+                &present(cert.clone()),
+            )
+            .unwrap(),
+            HostDecision::Accept
+        ));
+
+        let malformed = dir.path().join("malformed");
+        std::fs::write(&malformed, "127.0.0.1 ssh-ed25519 AAAA\n").unwrap();
+        let error = decide_host_key(
+            &[known],
+            &[malformed],
+            &TrustStore::default(),
+            "127.0.0.1",
+            22,
+            None,
+            &present(cert),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "revoked_host_keys");
+        let krl = dir.path().join("revoked.krl");
+        std::fs::write(&krl, b"SSHKRL not a real list").unwrap();
+        assert_eq!(
+            decide_host_key(
+                &[],
+                &[krl],
+                &TrustStore::default(),
+                "127.0.0.1",
+                22,
+                None,
+                &PublicKeyOrCertificate::from(host_key.public_key().clone()),
+            )
+            .unwrap_err()
+            .code,
+            "krl_unsupported"
+        );
     }
 }

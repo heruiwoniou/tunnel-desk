@@ -1481,3 +1481,289 @@ Host via-proxy
     app.disconnect_all().await.unwrap();
     assert!(server.log_text().contains("Accepted publickey"));
 }
+
+#[tokio::test]
+async fn plain_revoked_public_key_blocks_a_trusted_host_certificate() {
+    if !openssh_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("user_ca");
+    ssh_keygen(&["-q", "-t", "ed25519", "-f", ca.to_str().unwrap(), "-N", ""]);
+    let server = start_server(Some(&ca), Some("ops-team"), false);
+    let key = dir.path().join("id_ed25519");
+    ssh_keygen(&["-q", "-t", "ed25519", "-f", key.to_str().unwrap(), "-N", ""]);
+    sign_user(&ca, &key.with_extension("pub"), "ops-team", "-1d:+1d");
+    let host_pub = read_pub(&server.log.parent().unwrap().join("host_ed25519.pub"));
+    let revoked = dir.path().join("revoked.keys");
+    std::fs::write(
+        &revoked,
+        format!(
+            "# retired\n\n{host} fixture-comment\n",
+            host = host_pub.trim()
+        ),
+    )
+    .unwrap();
+    let known = dir.path().join("known_hosts");
+    std::fs::write(
+        &known,
+        known_ca(server.port, read_pub(&server_host_ca_pub(&server)).trim()),
+    )
+    .unwrap();
+    let config = format!(
+        "\
+Host revoked-list
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  CertificateFile {key}-cert.pub
+  IdentitiesOnly yes
+  IdentityAgent none
+  RevokedHostKeys {revoked}
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+",
+        port = server.port,
+        user = server.user,
+        key = key.display(),
+        revoked = revoked.display(),
+        known = known.display(),
+    );
+    let app = manager(dir.path(), &config);
+    app.store()
+        .save_profiles(&[profile(
+            "revoked-list",
+            "revoked-list",
+            AuthMode::PublicKey,
+            vec![],
+        )])
+        .unwrap();
+    let err = app
+        .connect(
+            "revoked-list",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("revoked host public key");
+    assert_eq!(err.code, "host_cert_revoked");
+}
+
+#[tokio::test]
+async fn agent_signs_certificate_while_encrypted_private_file_remains() {
+    if !openssh_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ca = dir.path().join("user_ca");
+    ssh_keygen(&["-q", "-t", "ed25519", "-f", ca.to_str().unwrap(), "-N", ""]);
+    let server = start_server(Some(&ca), Some("ops-team"), false);
+    let key = dir.path().join("id_ed25519");
+    let other = dir.path().join("other_ed25519");
+    let passphrase = "td-fixture-agent-passphrase";
+    ssh_keygen(&[
+        "-q",
+        "-t",
+        "ed25519",
+        "-f",
+        key.to_str().unwrap(),
+        "-N",
+        passphrase,
+    ]);
+    ssh_keygen(&[
+        "-q",
+        "-t",
+        "ed25519",
+        "-f",
+        other.to_str().unwrap(),
+        "-N",
+        "",
+    ]);
+    let sock = dir.path().join("agent.sock");
+    let agent = Agent {
+        child: Some(
+            Command::new("ssh-agent")
+                .args(["-D", "-a", sock.to_str().unwrap()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        ),
+        sock: sock.clone(),
+    };
+    for _ in 0..50 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    add_encrypted(&sock, &key, passphrase);
+    let listed = Command::new("ssh-add")
+        .env("SSH_AUTH_SOCK", &sock)
+        .arg("-L")
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !listing.contains("-cert-v01@openssh.com"),
+        "the agent must hold only the ordinary signing key"
+    );
+    sign_user(&ca, &key.with_extension("pub"), "ops-team", "-1d:+1d");
+    let mismatched_cert = PathBuf::from(format!("{}-cert.pub", other.display()));
+    sign_user(&ca, &other.with_extension("pub"), "ops-team", "-1d:+1d");
+    let known = dir.path().join("known_hosts");
+    std::fs::write(
+        &known,
+        known_ca(server.port, read_pub(&server_host_ca_pub(&server)).trim()),
+    )
+    .unwrap();
+    let config = format!(
+        "\
+Host agentcert
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  CertificateFile {key}-cert.pub
+  IdentitiesOnly yes
+  IdentityAgent {sock}
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+Host noagent
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  CertificateFile {key}-cert.pub
+  IdentitiesOnly yes
+  IdentityAgent none
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+Host mismatch
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  CertificateFile {key}-cert.pub
+  IdentitiesOnly yes
+  IdentityAgent {sock}
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+",
+        port = server.port,
+        user = server.user,
+        key = key.display(),
+        sock = sock.display(),
+        known = known.display(),
+    );
+    let app = manager(dir.path(), &config);
+    app.store()
+        .save_profiles(&[
+            profile("agent", "agentcert", AuthMode::Agent, vec![]),
+            profile("auto", "agentcert", AuthMode::Auto, vec![]),
+            profile("file", "agentcert", AuthMode::PublicKey, vec![]),
+            profile("noagent", "noagent", AuthMode::Auto, vec![]),
+            profile("mismatch", "mismatch", AuthMode::Auto, vec![]),
+        ])
+        .unwrap();
+    app.connect(
+        "agent",
+        None,
+        None,
+        false,
+        false,
+        Arc::new(FixedPrompter(false)),
+    )
+    .await
+    .expect("agent signs the certificate without the key passphrase");
+    app.disconnect("agent").await.unwrap();
+    app.connect(
+        "auto",
+        None,
+        None,
+        false,
+        false,
+        Arc::new(FixedPrompter(false)),
+    )
+    .await
+    .expect("automatic mode uses the unlocked agent key");
+    app.disconnect("auto").await.unwrap();
+    let file_only = app
+        .connect(
+            "file",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(false)),
+        )
+        .await
+        .expect_err("file-only mode must not use the agent");
+    assert_eq!(file_only.code, "passphrase_required");
+    let disabled = app
+        .connect(
+            "noagent",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(false)),
+        )
+        .await
+        .expect_err("IdentityAgent none");
+    assert_eq!(disabled.code, "passphrase_required");
+    std::fs::copy(
+        &mismatched_cert,
+        PathBuf::from(format!("{}-cert.pub", key.display())),
+    )
+    .unwrap();
+    let mismatched = app
+        .connect(
+            "mismatch",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(false)),
+        )
+        .await
+        .expect_err("mismatched certificate");
+    assert_eq!(mismatched.code, "certificate_key_mismatch");
+    assert!(!server.log_text().contains(&passphrase));
+    drop(agent);
+}
+
+fn add_encrypted(sock: &Path, key: &Path, passphrase: &str) {
+    let script = key.with_file_name("askpass.sh");
+    std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$TD_ASKPASS\"\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    let output = Command::new("ssh-add")
+        .env("SSH_AUTH_SOCK", sock)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", "td-fixture")
+        .env("SSH_ASKPASS", &script)
+        .env("TD_ASKPASS", passphrase)
+        .arg(key)
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        let mut err = String::from_utf8_lossy(&output.stderr).into_owned();
+        let out = String::from_utf8_lossy(&output.stdout);
+        err.push_str(&out.replace(passphrase, "[redacted]"));
+        let err = err.replace(passphrase, "[redacted]");
+        panic!("ssh-add could not unlock the fixture key: {err}");
+    }
+}

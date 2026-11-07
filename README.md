@@ -68,7 +68,8 @@ ssh -T [-F 文件] -G -- 目标
 
 - 只读 `~/.ssh/config` 和 `known_hosts`，不改写它们，也不改 `sshd`、`GatewayPorts` 或防火墙。
 - 未知主机密钥必须在界面里明确信任。已变化或已吊销的密钥直接拒绝，不会自动替换。应用自己的信任记录在单独的 `trust.json`。哈希过的 `known_hosts` 可以信任。
-- 主机证书只在 `known_hosts` 或 `UserKnownHostsFile` 里有匹配的 `@cert-authority` 时才信任。证书失败时，按 OpenSSH 的做法退回证书里的原始主机公钥；被吊销的证书或 CA 不会退回。KRL（`SSHKRL`）读不懂就拒绝连接。
+- 主机证书只在 `known_hosts` 或 `UserKnownHostsFile` 里有匹配的 `@cert-authority` 时才信任。证书失败时，按 OpenSSH 的做法退回证书里的原始主机公钥；被吊销的证书或 CA 不会退回。
+- `RevokedHostKeys` 是一行一把公钥（可带注释），不是 `known_hosts`。列出的公钥会吊销对应的主机公钥、由它签出的主机证书，以及用它当 CA 的主机证书。空行和 `#` 注释会被忽略。读不了、KRL（`SSHKRL`），或某一行不是公钥时，连接直接拒绝。KRL 本身没有实现。
 - 监听地址默认回环。写成 `0.0.0.0` 或 `::` 必须勾选对外暴露，并看到警告。
 - 别名、主机、用户、路径、跳板和端口都做校验，拒绝空格、控制字符和把额外选项塞进字段。
 - `ProxyCommand` 只来自 SSH 配置，按 OpenSSH 的方式整段交给 shell（Unix `/bin/sh -c`，Windows `cmd.exe /C`），不是界面上的自由命令框。子进程在取消时被结束。
@@ -117,7 +118,13 @@ Host db
   IdentityFile ~/.ssh/id_ed25519
 ```
 
-只写 `IdentityFile ~/.ssh/id_ed25519`、并且完全没有 `CertificateFile` 时，才会自动使用 `~/.ssh/id_ed25519-cert.pub`。只要配置了任何一个 `CertificateFile`，就不会再自动发现其他证书。私钥已在 agent 中解锁时，可以不读取本地私钥文件；`IdentityAgent none` 则不会去问 agent。加密私钥要的是口令，不是服务器登录密码。
+只写 `IdentityFile ~/.ssh/id_ed25519`、并且完全没有 `CertificateFile` 时，才会自动使用 `~/.ssh/id_ed25519-cert.pub`。只要配置了任何一个 `CertificateFile`，就不会再自动发现其他证书。agent 里已经解锁同一把签名密钥时，优先用 agent 给证书签名，即使本地私钥文件还在而且加了密；不会把私钥从 agent 里导出。`IdentityAgent none` 或公钥模式不会去问 agent。加密私钥要的是口令，不是服务器登录密码。
+
+```text
+# RevokedHostKeys 示例。占位公钥，不是真实密钥。
+ssh-ed25519 AAAA...example retired-host
+ssh-rsa AAAA...example old-ca
+```
 
 主机信任示例：
 
