@@ -2,6 +2,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod forward;
+pub mod identity;
 pub mod known_hosts;
 pub mod model;
 pub mod secrets;
@@ -12,6 +13,8 @@ pub mod tunnel;
 #[cfg(test)]
 mod ssh_itest;
 
+#[cfg(all(test, unix))]
+mod cert_itest;
 #[cfg(all(test, unix))]
 mod sshd_itest;
 

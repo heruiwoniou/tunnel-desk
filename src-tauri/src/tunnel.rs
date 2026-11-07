@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,7 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use russh::client::{self, Handler, Msg, Session};
+use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
+use russh::keys::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect};
 use serde::Serialize;
@@ -20,7 +23,8 @@ use zeroize::Zeroizing;
 use crate::config::{ResolvedHost, Resolver};
 use crate::error::{AppError, sanitize_secret};
 use crate::forward::ValidatedForward;
-use crate::known_hosts::{self, HostKeyVerdict, TrustEntry, TrustStore};
+use crate::identity::{self, AuthOffer, KeySource, ListedAgentKey};
+use crate::known_hosts::{self, TrustEntry, TrustStore};
 use crate::model::{
     AuthMode, Direction, ForwardStatus, HistoryEntry, Phase, Profile, Target, TunnelSnapshot,
     now_rfc3339,
@@ -57,9 +61,14 @@ pub struct Endpoint {
     pub host: String,
     pub port: u16,
     pub identity_files: Vec<String>,
+    pub certificate_files: Vec<String>,
     pub identities_only: bool,
+    pub pubkey_authentication: bool,
     pub identity_agent: Option<String>,
+    pub host_key_alias: Option<String>,
     pub known_hosts_files: Vec<PathBuf>,
+    pub revoked_host_keys: Vec<PathBuf>,
+    pub preferred: Vec<String>,
     pub proxy_command: Option<String>,
 }
 
@@ -68,7 +77,6 @@ pub struct SessionSpec {
     pub name: String,
     pub hops: Vec<Endpoint>,
     pub auth_mode: AuthMode,
-    pub preferred: Vec<String>,
     pub forwards: Vec<ValidatedForward>,
     pub password: Option<Zeroizing<String>>,
     pub passphrase: Option<Zeroizing<String>>,
@@ -444,6 +452,7 @@ impl TunnelManager {
                     && !path.trim().is_empty()
                 {
                     resolved.identity_files = vec![path.clone()];
+                    resolved.certificate_files.clear();
                 }
                 if let Some(jump) = proxy_jump {
                     if jump.trim().is_empty() {
@@ -475,16 +484,11 @@ impl TunnelManager {
             .iter()
             .map(crate::forward::validate_mapping)
             .collect::<Result<Vec<_>, _>>()?;
-        let preferred = hops
-            .last()
-            .map(|hop| hop.preferred.clone())
-            .unwrap_or_default();
         Ok(SessionSpec {
             profile_id: profile.id.clone(),
             name: profile.name.clone(),
             hops: hops.into_iter().map(Endpoint::from).collect(),
             auth_mode: profile.auth_mode,
-            preferred,
             forwards,
             password,
             passphrase,
@@ -548,7 +552,6 @@ impl TunnelManager {
 
 struct ResolvedHop {
     endpoint: Endpoint,
-    preferred: Vec<String>,
 }
 
 impl From<ResolvedHop> for Endpoint {
@@ -594,19 +597,27 @@ fn append_resolved(
 
 fn resolved_hop(resolved: ResolvedHost) -> ResolvedHop {
     ResolvedHop {
-        preferred: resolved.preferred_authentications.clone(),
         endpoint: Endpoint {
             user: resolved.user,
             host: resolved.hostname,
             port: resolved.port,
             identity_files: resolved.identity_files,
+            certificate_files: resolved.certificate_files,
             identities_only: resolved.identities_only,
+            pubkey_authentication: resolved.pubkey_authentication,
             identity_agent: resolved.identity_agent,
+            host_key_alias: resolved.host_key_alias,
             known_hosts_files: resolved
                 .known_hosts_files
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            revoked_host_keys: resolved
+                .revoked_host_keys
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            preferred: resolved.preferred_authentications,
             proxy_command: resolved.proxy_command,
         },
     }
@@ -812,7 +823,9 @@ async fn run_session(
         let handler = ClientHandler {
             host: endpoint.host.clone(),
             port: endpoint.port,
+            host_key_alias: endpoint.host_key_alias.clone(),
             known_hosts: endpoint.known_hosts_files.clone(),
+            revoked_host_keys: endpoint.revoked_host_keys.clone(),
             trust: trust.clone(),
             trust_path: trust_path.clone(),
             prompter: prompter.clone(),
@@ -1049,6 +1062,26 @@ fn client_config() -> client::Config {
     config.nodelay = true;
     config.keepalive_interval = Some(Duration::from_secs(20));
     config.keepalive_max = 3;
+    // Advertise certificate host keys ahead of raw keys. ssh-rsa (SHA-1)
+    // certificates are intentionally absent.
+    config.preferred.host_key_certificates = Cow::Owned(vec![
+        Algorithm::Ed25519,
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        },
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP384,
+        },
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP521,
+        },
+        Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512),
+        },
+        Algorithm::Rsa {
+            hash: Some(HashAlg::Sha256),
+        },
+    ]);
     config
 }
 
@@ -1062,7 +1095,9 @@ struct RemoteRule {
 struct ClientHandler {
     host: String,
     port: u16,
+    host_key_alias: Option<String>,
     known_hosts: Vec<PathBuf>,
+    revoked_host_keys: Vec<PathBuf>,
     trust: Arc<Mutex<TrustStore>>,
     trust_path: PathBuf,
     prompter: Arc<dyn HostKeyPrompter>,
@@ -1079,45 +1114,34 @@ impl Handler for ClientHandler {
         &mut self,
         server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        if server_public_key.certificate().is_some() {
-            return Err(AppError::new(
-                "host_cert_unsupported",
-                "服务器出示的是主机证书。TunnelDesk 目前只接受原始主机密钥，不会跳过校验。",
-            ));
-        }
-        let key = server_public_key.public_key();
-        let verdict = match known_hosts::check_known_hosts_files(
+        let lookup = self
+            .host_key_alias
+            .clone()
+            .unwrap_or_else(|| self.host.clone());
+        let trust = self.trust.lock().expect("trust").clone();
+        match known_hosts::decide_host_key(
             &self.known_hosts,
+            &self.revoked_host_keys,
+            &trust,
             &self.host,
             self.port,
-            &key,
+            self.host_key_alias.as_deref(),
+            server_public_key,
         )? {
-            HostKeyVerdict::Unknown => self
-                .trust
-                .lock()
-                .expect("trust")
-                .verdict(&self.host, self.port, &key),
-            other => other,
-        };
-        match verdict {
-            HostKeyVerdict::Trusted { .. } => Ok(true),
-            HostKeyVerdict::Revoked { source } => Err(AppError::new(
-                "host_key_revoked",
-                format!("主机密钥已被吊销（{source}），连接已拒绝"),
-            )),
-            HostKeyVerdict::Changed { source, previous } => Err(AppError::new(
-                "host_key_changed",
-                format!(
-                    "主机密钥与已记录的值不一致（{source}）。已记录 {previous}，本次为 {}。连接已拒绝，不会自动更换信任。",
-                    known_hosts::fingerprint(&key)
-                ),
-            )),
-            HostKeyVerdict::Unknown => {
+            known_hosts::HostDecision::Accept => Ok(true),
+            known_hosts::HostDecision::Reject { code, message } => {
+                Err(AppError::new(code, message))
+            }
+            known_hosts::HostDecision::Prompt {
+                algorithm,
+                fingerprint,
+                public_key,
+            } => {
                 let prompt = HostKeyPrompt {
-                    host: self.host.clone(),
+                    host: lookup,
                     port: self.port,
-                    algorithm: known_hosts::algorithm_name(&key),
-                    fingerprint: known_hosts::fingerprint(&key),
+                    algorithm: algorithm.clone(),
+                    fingerprint: fingerprint.clone(),
                 };
                 if !self.prompter.confirm_unknown(&prompt).await {
                     return Err(AppError::new(
@@ -1126,11 +1150,11 @@ impl Handler for ClientHandler {
                     ));
                 }
                 let entry = TrustEntry {
-                    host: self.host.clone(),
+                    host: prompt.host.clone(),
                     port: self.port,
-                    algorithm: prompt.algorithm,
-                    fingerprint: prompt.fingerprint,
-                    public_key: key.to_openssh().unwrap_or_default(),
+                    algorithm,
+                    fingerprint,
+                    public_key,
                     trusted_at: now_rfc3339(),
                 };
                 let snapshot = {
@@ -1246,50 +1270,79 @@ async fn authenticate_final(
     endpoint: &Endpoint,
     spec: &SessionSpec,
 ) -> Result<(), AppError> {
-    let order = if spec.preferred.is_empty() {
+    let configured = if endpoint.preferred.is_empty() {
         vec![
             "publickey".into(),
             "password".into(),
             "keyboard-interactive".into(),
         ]
     } else {
-        spec.preferred.clone()
+        endpoint.preferred.clone()
     };
     let order = match spec.auth_mode {
         AuthMode::Agent => vec!["publickey-agent".into()],
         AuthMode::PublicKey => vec!["publickey-file".into()],
         AuthMode::Password => vec!["password".into(), "keyboard-interactive".into()],
-        AuthMode::Auto => order,
+        AuthMode::Auto => configured,
     };
+    let password_allowed = order
+        .iter()
+        .any(|method| matches!(method.as_str(), "password" | "keyboard-interactive"));
     let mut saw_encrypted_key = false;
-    for method in order {
+    let mut notes = Vec::new();
+    for method in &order {
         match method.as_str() {
             "publickey" => {
-                if try_agent(handle, endpoint).await? {
-                    return Ok(());
-                }
-                match try_files(handle, endpoint, spec.passphrase.as_ref()).await? {
+                match try_publickey(
+                    handle,
+                    endpoint,
+                    spec.passphrase.as_ref(),
+                    PublicKeyFilter::Any,
+                )
+                .await?
+                {
                     FileAttempt::Success => return Ok(()),
                     FileAttempt::NeedsPassphrase => saw_encrypted_key = true,
-                    FileAttempt::Failed => {}
+                    FileAttempt::Failed { notes: found } => notes.extend(found),
                 }
             }
             "publickey-agent" => {
-                if try_agent(handle, endpoint).await? {
-                    return Ok(());
+                match try_publickey(
+                    handle,
+                    endpoint,
+                    spec.passphrase.as_ref(),
+                    PublicKeyFilter::AgentOnly,
+                )
+                .await?
+                {
+                    FileAttempt::Success => return Ok(()),
+                    FileAttempt::NeedsPassphrase => saw_encrypted_key = true,
+                    FileAttempt::Failed { notes: found } => {
+                        notes.extend(found);
+                        return auth_failure(
+                            saw_encrypted_key,
+                            spec.passphrase.is_none(),
+                            false,
+                            &notes,
+                            Some("agent_unavailable"),
+                        );
+                    }
                 }
-                return Err(AppError::new(
-                    "agent_unavailable",
-                    "SSH agent 没有接受此次认证",
-                ));
             }
             "publickey-file" => {
-                match try_files(handle, endpoint, spec.passphrase.as_ref()).await? {
+                match try_publickey(
+                    handle,
+                    endpoint,
+                    spec.passphrase.as_ref(),
+                    PublicKeyFilter::FilesOnly,
+                )
+                .await?
+                {
                     FileAttempt::Success => return Ok(()),
                     FileAttempt::NeedsPassphrase => {
                         return Err(AppError::new("passphrase_required", "私钥已加密，需要口令"));
                     }
-                    FileAttempt::Failed => {}
+                    FileAttempt::Failed { notes: found } => notes.extend(found),
                 }
             }
             "password" | "keyboard-interactive" => {
@@ -1309,13 +1362,62 @@ async fn authenticate_final(
             _ => {}
         }
     }
-    if spec.password.is_none() && matches!(spec.auth_mode, AuthMode::Password | AuthMode::Auto) {
-        return Err(AppError::new("password_required", "需要服务器密码"));
-    }
-    if saw_encrypted_key && spec.passphrase.is_none() {
+    auth_failure(
+        saw_encrypted_key,
+        spec.passphrase.is_none(),
+        password_allowed && spec.password.is_none(),
+        &notes,
+        None,
+    )
+}
+
+fn auth_failure(
+    saw_encrypted_key: bool,
+    passphrase_missing: bool,
+    password_missing: bool,
+    notes: &[identity::PlanNote],
+    forced_code: Option<&str>,
+) -> Result<(), AppError> {
+    if saw_encrypted_key && passphrase_missing {
         return Err(AppError::new("passphrase_required", "私钥已加密，需要口令"));
     }
-    Err(AppError::new("auth_failed", "认证失败"))
+    if let Some(note) = notes.iter().find(|note| {
+        matches!(
+            note.code,
+            "certificate_expired"
+                | "certificate_not_yet_valid"
+                | "certificate_key_mismatch"
+                | "certificate_needs_private_key"
+                | "certificate_unreadable"
+                | "certificate_missing"
+                | "not_user_certificate"
+                | "critical_option_unsupported"
+                | "verify_required_unsupported"
+                | "certificate_signature_unsupported"
+                | "security_key_unsupported"
+        )
+    }) {
+        return Err(AppError::new(note.code, note.message.clone()));
+    }
+    if let Some(code) = forced_code {
+        return Err(AppError::new(code, "SSH agent 没有接受此次认证"));
+    }
+    if password_missing {
+        return Err(AppError::new("password_required", "需要服务器密码"));
+    }
+    let detail = notes
+        .iter()
+        .map(|note| note.message.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Err(AppError::new(
+        "auth_failed",
+        if detail.is_empty() {
+            "认证失败".into()
+        } else {
+            format!("认证失败。{detail}")
+        },
+    ))
 }
 
 async fn authenticate_jump(
@@ -1323,10 +1425,22 @@ async fn authenticate_jump(
     endpoint: &Endpoint,
     passphrase: Option<&Zeroizing<String>>,
 ) -> Result<(), AppError> {
-    if try_agent(handle, endpoint).await? {
-        return Ok(());
+    if !endpoint.pubkey_authentication
+        && endpoint
+            .preferred
+            .iter()
+            .all(|method| method != "publickey")
+        && !endpoint.preferred.is_empty()
+    {
+        return Err(AppError::new(
+            "jump_auth_failed",
+            format!(
+                "无法认证跳板 {}。跳板需要 agent 或密钥，不使用目标服务器密码。",
+                endpoint.host
+            ),
+        ));
     }
-    match try_files(handle, endpoint, passphrase).await? {
+    match try_publickey(handle, endpoint, passphrase, PublicKeyFilter::Any).await? {
         FileAttempt::Success => Ok(()),
         FileAttempt::NeedsPassphrase => Err(AppError::new(
             "jump_auth_failed",
@@ -1335,13 +1449,24 @@ async fn authenticate_jump(
                 endpoint.host
             ),
         )),
-        FileAttempt::Failed => Err(AppError::new(
-            "jump_auth_failed",
-            format!(
-                "无法认证跳板 {}。跳板需要 agent 或密钥，不使用目标服务器密码。",
-                endpoint.host
-            ),
-        )),
+        FileAttempt::Failed { notes } => {
+            let detail = notes
+                .iter()
+                .map(|note| note.message.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Err(AppError::new(
+                "jump_auth_failed",
+                if detail.is_empty() {
+                    format!(
+                        "无法认证跳板 {}。跳板需要 agent 或密钥，不使用目标服务器密码。",
+                        endpoint.host
+                    )
+                } else {
+                    format!("无法认证跳板 {}。{detail}", endpoint.host)
+                },
+            ))
+        }
     }
 }
 
@@ -1382,53 +1507,339 @@ async fn try_keyboard(
     Ok(false)
 }
 
+enum PublicKeyFilter {
+    Any,
+    AgentOnly,
+    FilesOnly,
+}
+
 enum FileAttempt {
     Success,
     NeedsPassphrase,
-    Failed,
+    Failed { notes: Vec<identity::PlanNote> },
 }
 
-async fn try_files(
+async fn try_publickey(
     handle: &mut client::Handle<ClientHandler>,
     endpoint: &Endpoint,
     passphrase: Option<&Zeroizing<String>>,
+    filter: PublicKeyFilter,
 ) -> Result<FileAttempt, AppError> {
-    let mut needs_passphrase = false;
-    for path in &endpoint.identity_files {
-        if !std::path::Path::new(path).is_file() {
-            continue;
+    #[cfg(unix)]
+    {
+        let mut agent = connect_agent_unix(endpoint.identity_agent.as_deref()).await?;
+        if let Some(agent) = agent.as_mut()
+            && let Some(binding) = handle.agent_session_binding()
+        {
+            let _ = agent.bind_session(binding, false).await;
         }
-        let loaded = match russh::keys::load_secret_key(path, None) {
-            Ok(key) => key,
-            Err(russh::keys::Error::KeyIsEncrypted) => {
-                let Some(passphrase) = passphrase else {
-                    needs_passphrase = true;
-                    continue;
-                };
-                match russh::keys::load_secret_key(path, Some(passphrase.as_str())) {
-                    Ok(key) => key,
-                    Err(_) => return Err(AppError::new("auth_failed", "密钥口令不正确")),
-                }
-            }
-            Err(_) => continue,
-        };
-        let hash_alg = if matches!(loaded.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
-            supported_rsa_hash(handle).await
-        } else {
-            None
-        };
-        let wrapped = PrivateKeyWithHashAlg::new(std::sync::Arc::new(loaded), hash_alg);
-        let result = handle
-            .authenticate_publickey(&endpoint.user, wrapped)
-            .await?;
-        if result.success() {
-            return Ok(FileAttempt::Success);
+        offer_publickey(handle, endpoint, passphrase, &mut agent, filter).await
+    }
+    #[cfg(windows)]
+    {
+        let mut agent = connect_agent_windows(endpoint.identity_agent.as_deref()).await?;
+        if let Some(agent) = agent.as_mut()
+            && let Some(binding) = handle.agent_session_binding()
+        {
+            let _ = agent.bind_session(binding, false).await;
+        }
+        offer_publickey(handle, endpoint, passphrase, &mut agent, filter).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut agent: Option<AgentClient<tokio::net::TcpStream>> = None;
+        let _ = filter;
+        offer_publickey(
+            handle,
+            endpoint,
+            passphrase,
+            &mut agent,
+            PublicKeyFilter::FilesOnly,
+        )
+        .await
+    }
+}
+
+async fn offer_publickey<S>(
+    handle: &mut client::Handle<ClientHandler>,
+    endpoint: &Endpoint,
+    passphrase: Option<&Zeroizing<String>>,
+    agent: &mut Option<AgentClient<S>>,
+    filter: PublicKeyFilter,
+) -> Result<FileAttempt, AppError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    let identities = if let Some(agent) = agent.as_mut() {
+        agent.request_identities().await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let listed = identities.iter().map(listed_agent_key).collect::<Vec<_>>();
+    let plan = identity::plan_authentication(
+        &endpoint.identity_files,
+        &endpoint.certificate_files,
+        endpoint.identities_only,
+        endpoint.pubkey_authentication,
+        &listed,
+        identity::unix_now(),
+    );
+    let mut needs_passphrase = false;
+    for offer in &plan.offers {
+        match filter {
+            PublicKeyFilter::AgentOnly if !matches!(offer.source, KeySource::Agent(_)) => continue,
+            PublicKeyFilter::FilesOnly if !matches!(offer.source, KeySource::File(_)) => continue,
+            _ => {}
+        }
+        match execute_offer(handle, endpoint, offer, passphrase, agent, &identities).await? {
+            FileAttempt::Success => return Ok(FileAttempt::Success),
+            FileAttempt::NeedsPassphrase => needs_passphrase = true,
+            FileAttempt::Failed { .. } => {}
         }
     }
     if needs_passphrase {
         Ok(FileAttempt::NeedsPassphrase)
     } else {
-        Ok(FileAttempt::Failed)
+        Ok(FileAttempt::Failed { notes: plan.notes })
+    }
+}
+
+fn listed_agent_key(identity: &AgentIdentity) -> ListedAgentKey {
+    match identity {
+        AgentIdentity::PublicKey { key, comment } => ListedAgentKey {
+            public_key: key.clone(),
+            certificate: None,
+            comment: comment.clone(),
+        },
+        AgentIdentity::Certificate {
+            certificate,
+            comment,
+        } => ListedAgentKey {
+            public_key: PublicKey::new(certificate.public_key().clone(), comment.as_str()),
+            certificate: Some(certificate.clone()),
+            comment: comment.clone(),
+        },
+    }
+}
+
+async fn execute_offer<S>(
+    handle: &mut client::Handle<ClientHandler>,
+    endpoint: &Endpoint,
+    offer: &AuthOffer,
+    passphrase: Option<&Zeroizing<String>>,
+    agent: &mut Option<AgentClient<S>>,
+    identities: &[AgentIdentity],
+) -> Result<FileAttempt, AppError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    match &offer.source {
+        KeySource::File(path) => {
+            let loaded = match load_private(path, passphrase)? {
+                PrivateLoad::Key(key) => key,
+                PrivateLoad::Encrypted => return Ok(FileAttempt::NeedsPassphrase),
+                PrivateLoad::Unavailable => {
+                    return Ok(FileAttempt::Failed { notes: Vec::new() });
+                }
+            };
+            if let Some(cert) = &offer.certificate
+                && loaded.public_key().key_data() != cert.public_key()
+            {
+                return Err(AppError::new(
+                    "certificate_key_mismatch",
+                    format!(
+                        "证书与私钥 {} 的公钥不一致。证书不能代替签名私钥",
+                        path.display()
+                    ),
+                ));
+            }
+            let hash_alg = if matches!(loaded.algorithm(), Algorithm::Rsa { .. }) {
+                supported_rsa_hash(handle).await
+            } else {
+                None
+            };
+            let key = std::sync::Arc::new(loaded);
+            let result = if let Some(cert) = &offer.certificate {
+                let mut signer = LocalKeySigner { key };
+                handle
+                    .authenticate_certificate_with(
+                        &endpoint.user,
+                        cert.clone(),
+                        hash_alg,
+                        &mut signer,
+                    )
+                    .await
+                    .map_err(|_| AppError::new("auth_failed", "无法用这把私钥完成证书签名"))?
+            } else {
+                let wrapped = PrivateKeyWithHashAlg::new(key, hash_alg);
+                handle
+                    .authenticate_publickey(&endpoint.user, wrapped)
+                    .await?
+            };
+            if result.success() {
+                Ok(FileAttempt::Success)
+            } else {
+                Ok(FileAttempt::Failed { notes: Vec::new() })
+            }
+        }
+        KeySource::Agent(index) => {
+            let (Some(agent), Some(identity)) = (agent.as_mut(), identities.get(*index)) else {
+                return Ok(FileAttempt::Failed { notes: Vec::new() });
+            };
+            let hash_alg = rsa_hash_for_identity(handle, identity).await;
+            let result = if let Some(cert) = &offer.certificate {
+                match identity {
+                    AgentIdentity::Certificate { .. } => {
+                        handle
+                            .authenticate_certificate_with(
+                                &endpoint.user,
+                                cert.clone(),
+                                hash_alg,
+                                agent,
+                            )
+                            .await
+                    }
+                    AgentIdentity::PublicKey { key, .. } => {
+                        let mut signer = PlainAgentSigner {
+                            agent,
+                            key: key.clone(),
+                        };
+                        handle
+                            .authenticate_certificate_with(
+                                &endpoint.user,
+                                cert.clone(),
+                                hash_alg,
+                                &mut signer,
+                            )
+                            .await
+                    }
+                }
+            } else {
+                let AgentIdentity::PublicKey { key, .. } = identity else {
+                    return Ok(FileAttempt::Failed { notes: Vec::new() });
+                };
+                handle
+                    .authenticate_publickey_with(&endpoint.user, key.clone(), hash_alg, agent)
+                    .await
+            };
+            match result {
+                Ok(result) if result.success() => Ok(FileAttempt::Success),
+                _ => Ok(FileAttempt::Failed { notes: Vec::new() }),
+            }
+        }
+    }
+}
+
+struct LocalKeySigner {
+    key: std::sync::Arc<russh::keys::PrivateKey>,
+}
+
+impl russh::Signer for LocalKeySigner {
+    type Error = russh::AgentAuthError;
+
+    fn auth_sign(
+        &mut self,
+        _key: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        to_sign: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send {
+        let key = self.key.clone();
+        async move {
+            use russh::keys::signature::Signer;
+            use russh::keys::ssh_encoding::Encode;
+            let signature = match key.key_data() {
+                russh::keys::ssh_key::private::KeypairData::Rsa(rsa) => {
+                    Signer::try_sign(&(rsa, hash_alg), to_sign.as_slice())
+                }
+                _ => Signer::try_sign(key.as_ref(), to_sign.as_slice()),
+            }
+            .map_err(|_| russh::keys::Error::CouldNotReadKey)?;
+            let mut wire = Vec::new();
+            signature
+                .encode(&mut wire)
+                .map_err(|_| russh::keys::Error::CouldNotReadKey)?;
+            let mut signed = to_sign;
+            wire.encode(&mut signed)
+                .map_err(|_| russh::keys::Error::CouldNotReadKey)?;
+            Ok(signed)
+        }
+    }
+}
+
+struct PlainAgentSigner<'a, S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    agent: &'a mut AgentClient<S>,
+    key: PublicKey,
+}
+
+impl<S> russh::Signer for PlainAgentSigner<'_, S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    type Error = russh::AgentAuthError;
+
+    fn auth_sign(
+        &mut self,
+        _key: &AgentIdentity,
+        hash_alg: Option<HashAlg>,
+        to_sign: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + Send {
+        let identity = AgentIdentity::PublicKey {
+            key: self.key.clone(),
+            comment: String::new(),
+        };
+        let agent = &mut *self.agent;
+        async move {
+            agent
+                .sign_request(&identity, hash_alg, to_sign)
+                .await
+                .map_err(Into::into)
+        }
+    }
+}
+
+enum PrivateLoad {
+    Key(russh::keys::PrivateKey),
+    Encrypted,
+    Unavailable,
+}
+
+fn load_private(
+    path: &std::path::Path,
+    passphrase: Option<&Zeroizing<String>>,
+) -> Result<PrivateLoad, AppError> {
+    if !path.is_file() {
+        return Ok(PrivateLoad::Unavailable);
+    }
+    match russh::keys::load_secret_key(path, None) {
+        Ok(key) => Ok(PrivateLoad::Key(key)),
+        Err(russh::keys::Error::KeyIsEncrypted) => {
+            let Some(passphrase) = passphrase else {
+                return Ok(PrivateLoad::Encrypted);
+            };
+            match russh::keys::load_secret_key(path, Some(passphrase.as_str())) {
+                Ok(key) => Ok(PrivateLoad::Key(key)),
+                Err(_) => Err(AppError::new("auth_failed", "密钥口令不正确")),
+            }
+        }
+        Err(_) => Ok(PrivateLoad::Unavailable),
+    }
+}
+
+async fn rsa_hash_for_identity(
+    handle: &client::Handle<ClientHandler>,
+    identity: &AgentIdentity,
+) -> Option<HashAlg> {
+    let algorithm = match identity {
+        AgentIdentity::PublicKey { key, .. } => key.algorithm(),
+        AgentIdentity::Certificate { certificate, .. } => certificate.algorithm(),
+    };
+    if matches!(algorithm, Algorithm::Rsa { .. }) {
+        supported_rsa_hash(handle).await
+    } else {
+        None
     }
 }
 
@@ -1437,80 +1848,12 @@ async fn supported_rsa_hash(
 ) -> Option<russh::keys::HashAlg> {
     match handle.best_supported_rsa_hash().await {
         Ok(Some(Some(alg))) => Some(alg),
-        _ => Some(russh::keys::HashAlg::Sha256),
+        _ => Some(HashAlg::Sha256),
     }
-}
-
-async fn try_agent(
-    handle: &mut client::Handle<ClientHandler>,
-    endpoint: &Endpoint,
-) -> Result<bool, AppError> {
-    #[cfg(not(unix))]
-    {
-        let _ = (handle, endpoint);
-        return Ok(false);
-    }
-    #[cfg(unix)]
-    {
-        let Some(mut agent) = connect_agent(endpoint.identity_agent.as_deref()).await? else {
-            return Ok(false);
-        };
-        if let Some(binding) = handle.agent_session_binding() {
-            let _ = agent.bind_session(binding, false).await;
-        }
-        let identities = match agent.request_identities().await {
-            Ok(identities) => identities,
-            Err(_) => return Ok(false),
-        };
-        let allowed = if endpoint.identities_only {
-            endpoint
-                .identity_files
-                .iter()
-                .filter_map(|path| identity_public(std::path::Path::new(path)))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        for identity in identities {
-            let russh::keys::agent::AgentIdentity::PublicKey { key, .. } = &identity else {
-                continue;
-            };
-            if endpoint.identities_only
-                && !allowed
-                    .iter()
-                    .any(|allowed| allowed.key_data() == key.key_data())
-            {
-                continue;
-            }
-            let hash_alg = if matches!(key.algorithm(), russh::keys::Algorithm::Rsa { .. }) {
-                supported_rsa_hash(handle).await
-            } else {
-                None
-            };
-            match handle
-                .authenticate_publickey_with(&endpoint.user, key.clone(), hash_alg, &mut agent)
-                .await
-            {
-                Ok(result) if result.success() => return Ok(true),
-                Ok(_) => continue,
-                Err(_) => continue,
-            }
-        }
-        Ok(false)
-    }
-}
-
-fn identity_public(path: &std::path::Path) -> Option<PublicKey> {
-    if let Ok(key) = russh::keys::load_secret_key(path, None) {
-        return Some(key.public_key().clone());
-    }
-    let text = std::fs::read_to_string(format!("{}.pub", path.display())).ok()?;
-    let line = text.lines().next()?.trim();
-    russh::keys::PublicKey::from_openssh(line).ok()
 }
 
 #[cfg(unix)]
-async fn connect_agent(
+async fn connect_agent_unix(
     explicit: Option<&str>,
 ) -> Result<Option<AgentClient<tokio::net::UnixStream>>, AppError> {
     let path = match explicit {
@@ -1522,6 +1865,25 @@ async fn connect_agent(
         Some(path) => path.to_string(),
     };
     match AgentClient::connect_uds(path).await {
+        Ok(agent) => Ok(Some(agent)),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(windows)]
+async fn connect_agent_windows(
+    explicit: Option<&str>,
+) -> Result<Option<AgentClient<tokio::net::windows::named_pipe::NamedPipeClient>>, AppError> {
+    let path = match explicit {
+        Some("none") | Some("") => return Ok(None),
+        Some(path) => path.to_string(),
+        None => std::env::var("SSH_AUTH_SOCK")
+            .unwrap_or_else(|_| r"\\.\pipe\openssh-ssh-agent".to_string()),
+    };
+    if !path.starts_with(r"\\.\pipe\") {
+        return Ok(None);
+    }
+    match AgentClient::connect_named_pipe(path).await {
         Ok(agent) => Ok(Some(agent)),
         Err(_) => Ok(None),
     }
