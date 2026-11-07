@@ -107,11 +107,15 @@ export type ResolvedHost = {
   user: string
   port: number
   identityFiles: string[]
+  certificateFiles: string[]
   identitiesOnly: boolean
+  pubkeyAuthentication: boolean
   proxyJump: string | null
   proxyCommand: string | null
   identityAgent: string | null
+  hostKeyAlias: string | null
   knownHostsFiles: string[]
+  revokedHostKeys: string[]
   preferredAuthentications: string[]
   resolution: string
   warnings: string[]

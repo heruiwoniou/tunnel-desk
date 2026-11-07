@@ -68,7 +68,7 @@ ssh -T [-F 文件] -G -- 目标
 
 - 只读 `~/.ssh/config` 和 `known_hosts`，不改写它们，也不改 `sshd`、`GatewayPorts` 或防火墙。
 - 未知主机密钥必须在界面里明确信任。已变化或已吊销的密钥直接拒绝，不会自动替换。应用自己的信任记录在单独的 `trust.json`。哈希过的 `known_hosts` 可以信任。
-- 证书密钥（`@cert-authority`、主机证书）不当作普通公钥信任。
+- 主机证书只在 `known_hosts` 或 `UserKnownHostsFile` 里有匹配的 `@cert-authority` 时才信任。证书失败时，按 OpenSSH 的做法退回证书里的原始主机公钥；被吊销的证书或 CA 不会退回。KRL（`SSHKRL`）读不懂就拒绝连接。
 - 监听地址默认回环。写成 `0.0.0.0` 或 `::` 必须勾选对外暴露，并看到警告。
 - 别名、主机、用户、路径、跳板和端口都做校验，拒绝空格、控制字符和把额外选项塞进字段。
 - `ProxyCommand` 只来自 SSH 配置，按 OpenSSH 的方式整段交给 shell（Unix `/bin/sh -c`，Windows `cmd.exe /C`），不是界面上的自由命令框。子进程在取消时被结束。
@@ -87,11 +87,45 @@ ssh -T [-F 文件] -G -- 目标
 - `ForwardAgent` 不启用。
 - `StrictHostKeyChecking=no/off/accept-new` 不沿用。未知主机仍要确认，变化的密钥仍拒绝。
 - `GSSAPIAuthentication`、`PKCS11Provider`、`ProxyUseFdpass` 不支持。
-- `CertificateFile` 只会被点名，不用于登录。
+- `CertificateFile` 会和匹配的 `IdentityFile` 一起用于登录。没有配置任何 `CertificateFile` 时，会自动尝试旁边的 `<私钥>-cert.pub`。证书本身是公钥，不能代替签名私钥。
+- `SecurityKeyProvider`、FIDO/`sk-` 密钥、`verify-required`、未知的证书关键选项，以及 SHA-1（`ssh-rsa`）证书签名，会说明原因并跳过，不会当成已经支持。
 - 配置文件里的 `LocalForward` / `RemoteForward` 不会自动变成隧道。映射必须在 TunnelDesk 里显式添加。
 - 跳板（`ProxyJump`）只用代理或私钥认证，不用目标机器的密码。键盘交互认证使用的是服务器密码，不是私钥口令。
 
-手动主机可以覆盖解析结果。身份文件留空则继承配置；跳板留空并勾选清除时，表示明确不要跳板。
+手动主机可以覆盖解析结果。身份文件留空则继承配置；填写身份文件会替换该主机的 `IdentityFile`，并清掉配置里的 `CertificateFile`，避免把另一把密钥配上原来的证书。旁边的 `<私钥>-cert.pub` 仍会自动发现。跳板留空并勾选清除时，表示明确不要跳板。
+
+用户证书和主机证书是两件事。下面只是占位示例，不是任何真实密钥：
+
+```sshconfig
+Host app
+  HostName app.example
+  User deploy
+  IdentityFile ~/.ssh/id_ed25519
+  CertificateFile ~/.ssh/id_ed25519-cert.pub
+  IdentitiesOnly yes
+
+Host jump
+  HostName jump.example
+  IdentityFile ~/.ssh/jump_ed25519
+  CertificateFile ~/.ssh/jump_ed25519-cert.pub
+  IdentitiesOnly yes
+
+Host db
+  HostName db.internal
+  User db
+  ProxyJump jump
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+只写 `IdentityFile ~/.ssh/id_ed25519`、并且完全没有 `CertificateFile` 时，才会自动使用 `~/.ssh/id_ed25519-cert.pub`。只要配置了任何一个 `CertificateFile`，就不会再自动发现其他证书。私钥已在 agent 中解锁时，可以不读取本地私钥文件；`IdentityAgent none` 则不会去问 agent。加密私钥要的是口令，不是服务器登录密码。
+
+主机信任示例：
+
+```text
+@cert-authority app.example ssh-ed25519 AAAA...example-ca
+```
+
+这只信任这把 CA 签过的主机证书。不会因为解析到 `CertificateFile` 就接受任意服务器证书。
 
 Windows 上配置路径是用户配置目录下的 `.ssh/config`。
 
@@ -231,7 +265,10 @@ russh 测试服务器仍覆盖：双向数据、断开释放端口、错误口�
 
 ## 已知限制
 
-- 不支持 GSSAPI、PKCS#11、SSH 证书、`ProxyUseFdpass`、agent 转发。
+- 不支持 GSSAPI、PKCS#11、FIDO/安全密钥、Pageant、OpenSSH KRL、`ProxyUseFdpass`、agent 转发。
+- 用户证书的 principal 和 `source-address` 由服务器判定。客户端不把 principal 当成必须等于登录用户名，也不在本机猜测 NAT 之后的源地址。
+- 主机证书的 principal 按 OpenSSH 9.6 做精确比较，不把 `*.example` 当成通配。`HostKeyAlias` 同时用于 known_hosts 查找和 principal。空的 principal 列表表示任意主机名。
+- Windows 命名管道 agent（`\\.\pipe\openssh-ssh-agent`）有代码，但没有在 Windows 上用真实 agent 验证。macOS agent 与 Linux 一样走 Unix socket；macOS CI 没有 `useradd`，因此没有在 macOS 上跑 sshd 证书集成测试。Pageant 没有接入。
 - 跳板不用目标主机的密码。
 - 配置文件里的 `LocalForward` / `RemoteForward` 不会自动套用。
 - 没有用户会话总线或钥匙串已锁定时，不能记住密码。普通桌面会话若没有已解锁的 Secret Service，设置页会显示钥匙串不可用。

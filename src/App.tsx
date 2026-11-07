@@ -473,6 +473,11 @@ export default function App() {
                     {resolved.identityFiles.length > 0 ? (
                       <p className="break-all text-muted-foreground">{resolved.identityFiles.join(", ")}</p>
                     ) : null}
+                    {resolved.certificateFiles.length > 0 ? (
+                      <p className="break-all text-muted-foreground">
+                        CertificateFile {resolved.certificateFiles.join(", ")}
+                      </p>
+                    ) : null}
                     {resolved.warnings.map((warning) => (
                       <Alert key={warning}>
                         <AlertDescription>{warning}</AlertDescription>
@@ -796,11 +801,15 @@ export default function App() {
         user: "preview",
         port: 22,
         identityFiles: [],
+        certificateFiles: [],
         identitiesOnly: false,
+        pubkeyAuthentication: true,
         proxyJump: null,
         proxyCommand: null,
         identityAgent: null,
+        hostKeyAlias: null,
         knownHostsFiles: [],
+        revokedHostKeys: [],
         preferredAuthentications: [],
         resolution: "preview",
         warnings: [zh ? "浏览器预览没有读取你的 SSH 配置。" : "Browser preview did not read your SSH config."],

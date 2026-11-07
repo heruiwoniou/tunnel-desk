@@ -7,6 +7,24 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- OpenSSH user certificates from `~/.ssh/config`. Explicit `CertificateFile`
+  entries are paired with the matching `IdentityFile`, and `<identity>-cert.pub`
+  is discovered automatically when no `CertificateFile` is set. An unlocked
+  agent key can sign that certificate without exporting the private key.
+- Host certificates signed by a `@cert-authority` key in known_hosts. Revoked
+  certificates and authorities are rejected. A certificate that fails for
+  another reason falls back to the raw host key inside it.
+
+### Changed
+
+- `PubkeyAuthentication`, `HostKeyAlias`, and `RevokedHostKeys` are read from
+  the resolved host. `IdentitiesOnly` still limits which agent keys are offered.
+  Expired, not-yet-valid, mismatched, and unsupported certificates report their
+  own error instead of asking for the server password. SHA-1 certificate
+  signatures stay disabled.
+
 ## [0.1.0] - 2026-11-07
 
 ### Added
