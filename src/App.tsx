@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react"
 import { toast } from "sonner"
-import { CableIcon, PlusIcon, UnplugIcon } from "lucide-react"
+import { CableIcon, PlusIcon, Trash2Icon, UnplugIcon } from "lucide-react"
 
 import { ProfileDialog } from "@/components/profile-dialog"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -40,11 +40,13 @@ import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import {
+  addRuntimeForward,
   asAppError,
   backendInfo,
   clearHistory,
@@ -67,6 +69,7 @@ import {
   previewProfiles,
   previewSettings,
   resolveHost,
+  removeRuntimeForward,
   respondHostKey,
   runtimeSnapshots,
   saveProfile,
@@ -76,6 +79,8 @@ import {
 import { directionHelp, directionLabel, targetLabel } from "@/lib/draft"
 import type {
   BackendInfo,
+  Direction,
+  ForwardMapping,
   HistoryEntry,
   HostKeyEvent,
   Language,
@@ -105,7 +110,8 @@ export default function App() {
   const [trust, setTrust] = useState<TrustStore>({ entries: [] })
   const [selectedId, setSelectedId] = useState<string | null>(desktop ? null : previewProfiles[0]?.id ?? null)
   const [editor, setEditor] = useState<Profile | "new" | null>(null)
-  const [connectId, setConnectId] = useState<string | null>(null)
+  const [authChallenge, setAuthChallenge] = useState<{ profileId: string; code: string; message: string } | null>(null)
+  const [connectingId, setConnectingId] = useState<string | null>(null)
   const [hostKey, setHostKey] = useState<HostKeyEvent | null>(null)
   const [pendingDelete, setPendingDelete] = useState<Profile | null>(null)
   const [meta, setMeta] = useState<SecretMeta | null>(null)
@@ -139,8 +145,16 @@ export default function App() {
       unlisteners.push(await onHostKey((prompt) => setHostKey(prompt)))
       unlisteners.push(
         await onNeedsInput((payload) => {
-          setConnectId(payload.profileId)
-          toast.error(explain(payload.code, payload.message, settings.language))
+          if (payload.code === "password_required" || payload.code === "passphrase_required") {
+            setAuthChallenge({
+              profileId: payload.profileId,
+              code: payload.code,
+              message: payload.message,
+            })
+            setSelectedId(payload.profileId)
+          } else {
+            toast.error(explain(payload.code, payload.message, settings.language))
+          }
         }),
       )
       if (cancelled) unlisteners.forEach((unlisten) => unlisten())
@@ -224,6 +238,45 @@ export default function App() {
   }
 
   const runningCount = snapshots.filter((item) => busy.has(item.phase)).length
+
+  async function attemptConnect(
+    profileId: string,
+    secrets?: {
+      serverPassword?: string | null
+      keyPassphrase?: string | null
+      rememberServerPassword?: boolean
+      rememberKeyPassphrase?: boolean
+    },
+  ) {
+    if (!desktop) return
+    setConnectingId(profileId)
+    try {
+      const outcome = await connectProfile({
+        profileId,
+        serverPassword: secrets?.serverPassword ?? null,
+        keyPassphrase: secrets?.keyPassphrase ?? null,
+        rememberServerPassword: secrets?.rememberServerPassword ?? false,
+        rememberKeyPassphrase: secrets?.rememberKeyPassphrase ?? false,
+      })
+      outcome.warnings.forEach((warning) => toast.warning(warning.message))
+      toast.success(zh ? "隧道已建立" : "Tunnel is up")
+      setAuthChallenge(null)
+      setSnapshots(await runtimeSnapshots())
+      if (selected?.id === profileId) {
+        setMeta(await secretMeta(profileId).catch(() => null))
+      }
+    } catch (error) {
+      const body = asAppError(error)
+      if (body.code === "password_required" || body.code === "passphrase_required") {
+        setAuthChallenge({ profileId, code: body.code, message: body.message })
+      } else {
+        toast.error(explain(body.code, body.message, settings.language))
+        setAuthChallenge(null)
+      }
+    } finally {
+      setConnectingId(null)
+    }
+  }
 
   return (
     <main className="flex h-svh flex-col bg-background text-foreground">
@@ -343,41 +396,104 @@ export default function App() {
                       </CardTitle>
                       <CardDescription>{targetLabel(selected)}</CardDescription>
                     </CardHeader>
-                    <CardContent className="flex flex-col gap-3">
+                    <CardContent className="flex flex-col gap-4">
                       {snapshot?.message ? <p className="text-sm text-muted-foreground">{snapshot.message}</p> : null}
-                      <div className="flex flex-col gap-3">
-                        {selected.forwards.map((forward, index) => {
-                          const live = snapshot?.forwards.find((item) => item.id === forward.id)
-                          return (
-                            <div key={forward.id} className="flex flex-col gap-2">
-                              {index > 0 ? <Separator /> : null}
-                              <div className="flex flex-wrap items-center gap-2">
-                                <Badge variant="outline">{directionLabel(forward.direction, settings.language)}</Badge>
-                                <span className="text-xs text-muted-foreground">{directionHelp(forward.direction, settings.language)}</span>
-                              </div>
-                              <div className="grid gap-2 sm:grid-cols-2">
-                                <div className="flex flex-col gap-0.5">
-                                  <span className="text-xs text-muted-foreground">{zh ? "监听" : "Listen"}</span>
-                                  <span className="font-medium tabular-nums">
-                                    {forward.listenHost}:{forward.listenPort}
+                      <div className="flex flex-col gap-3 rounded-lg border bg-muted/30 p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-sm font-medium">{zh ? "端口映射" : "Port forwards"}</p>
+                          {phase === "connected" ? (
+                            <Badge variant="secondary">{zh ? "运行时可改" : "Live editable"}</Badge>
+                          ) : null}
+                        </div>
+                        {(phase === "connected" && snapshot ? snapshot.forwards : selected.forwards.map((forward) => ({
+                          id: forward.id,
+                          direction: forward.direction,
+                          listen: `${forward.listenHost}:${forward.listenPort}`,
+                          destination: `${forward.destinationHost}:${forward.destinationPort}`,
+                          state: zh ? "未启动" : "stopped",
+                          message: "",
+                        }))).length === 0 ? (
+                          <p className="text-sm text-muted-foreground">{zh ? "没有端口映射。" : "No forwards configured."}</p>
+                        ) : (
+                          <div className="flex flex-col gap-3">
+                            {(phase === "connected" && snapshot
+                              ? snapshot.forwards
+                              : selected.forwards.map((forward) => ({
+                                  id: forward.id,
+                                  direction: forward.direction,
+                                  listen: `${forward.listenHost}:${forward.listenPort}`,
+                                  destination: `${forward.destinationHost}:${forward.destinationPort}`,
+                                  state: zh ? "未启动" : "stopped",
+                                  message: "",
+                                }))
+                            ).map((forward, index) => {
+                              const config = selected.forwards.find((item) => item.id === forward.id)
+                              return (
+                                <div key={forward.id} className="flex flex-col gap-2">
+                                  {index > 0 ? <Separator /> : null}
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <Badge variant="outline">
+                                        {directionLabel((config?.direction ?? forward.direction) as Direction, settings.language)}
+                                      </Badge>
+                                      <span className="text-xs text-muted-foreground">
+                                        {directionHelp((config?.direction ?? forward.direction) as Direction, settings.language)}
+                                      </span>
+                                    </div>
+                                    {phase === "connected" && desktop ? (
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        onClick={() =>
+                                          void removeRuntimeForward(selected.id, forward.id, false)
+                                            .then(() => runtimeSnapshots().then(setSnapshots))
+                                            .then(() => toast.success(zh ? "映射已移除" : "Forward removed"))
+                                            .catch((error) => toast.error(asAppError(error).message))
+                                        }
+                                      >
+                                        <Trash2Icon data-icon="inline-start" />
+                                        {zh ? "移除" : "Remove"}
+                                      </Button>
+                                    ) : null}
+                                  </div>
+                                  <div className="grid gap-2 sm:grid-cols-2">
+                                    <div className="flex flex-col gap-0.5">
+                                      <span className="text-xs text-muted-foreground">{zh ? "监听" : "Listen"}</span>
+                                      <span className="font-medium tabular-nums">{forward.listen}</span>
+                                    </div>
+                                    <div className="flex flex-col gap-0.5">
+                                      <span className="text-xs text-muted-foreground">{zh ? "目标" : "Destination"}</span>
+                                      <span className="font-medium tabular-nums">{forward.destination}</span>
+                                    </div>
+                                  </div>
+                                  <span className="text-xs text-muted-foreground">
+                                    {zh ? "状态" : "State"}
+                                    {" · "}
+                                    {forward.state}
+                                    {forward.message ? ` · ${forward.message}` : ""}
                                   </span>
                                 </div>
-                                <div className="flex flex-col gap-0.5">
-                                  <span className="text-xs text-muted-foreground">{zh ? "目标" : "Destination"}</span>
-                                  <span className="font-medium tabular-nums">
-                                    {forward.destinationHost}:{forward.destinationPort}
-                                  </span>
-                                </div>
-                              </div>
-                              <span className="text-xs text-muted-foreground">
-                                {zh ? "状态" : "State"}
-                                {" · "}
-                                {live?.state ?? (zh ? "未启动" : "Stopped")}
-                                {live?.message ? ` · ${live.message}` : ""}
-                              </span>
-                            </div>
-                          )
-                        })}
+                              )
+                            })}
+                          </div>
+                        )}
+                        {phase === "connected" && desktop ? (
+                          <RuntimeForwardAdd
+                            language={settings.language}
+                            onAdd={async (mapping, persist) => {
+                              await addRuntimeForward(selected.id, mapping, persist)
+                              setSnapshots(await runtimeSnapshots())
+                              if (persist) {
+                                setProfiles((current) =>
+                                  current.map((item) =>
+                                    item.id === selected.id ? { ...item, forwards: [...item.forwards, mapping] } : item,
+                                  ),
+                                )
+                              }
+                              toast.success(zh ? "映射已添加" : "Forward added")
+                            }}
+                          />
+                        ) : null}
                       </div>
                       {meta ? (
                         <p className="text-sm text-muted-foreground">
@@ -393,7 +509,11 @@ export default function App() {
                             {zh ? "断开" : "Disconnect"}
                           </Button>
                         ) : (
-                          <Button disabled={!desktop} onClick={() => setConnectId(selected.id)}>
+                          <Button
+                            disabled={!desktop || connectingId === selected.id}
+                            onClick={() => void attemptConnect(selected.id)}
+                          >
+                            {connectingId === selected.id ? <Spinner data-icon="inline-start" /> : null}
                             {zh ? "连接" : "Connect"}
                           </Button>
                         )}
@@ -673,32 +793,27 @@ export default function App() {
         onSave={onSave}
       />
       <ConnectDialog
-        open={connectId !== null}
+        open={authChallenge !== null}
+        challengeCode={
+          authChallenge?.code === "password_required" || authChallenge?.code === "passphrase_required"
+            ? authChallenge.code
+            : null
+        }
+        challengeMessage={authChallenge?.message ?? null}
         language={settings.language}
         keyringAvailable={info?.keyringAvailable ?? false}
         keyringMessage={info?.keyringMessage ?? null}
         onOpenChange={(open) => {
-          if (!open) setConnectId(null)
+          if (!open) setAuthChallenge(null)
         }}
         onSubmit={async (serverPassword, keyPassphrase, rememberServerPassword, rememberKeyPassphrase) => {
-          if (!connectId) return
-          try {
-            const outcome = await connectProfile({
-              profileId: connectId,
-              serverPassword,
-              keyPassphrase,
-              rememberServerPassword,
-              rememberKeyPassphrase,
-            })
-            outcome.warnings.forEach((warning) => toast.warning(warning.message))
-            toast.success(zh ? "隧道已建立" : "Tunnel is up")
-            setConnectId(null)
-            setSnapshots(await runtimeSnapshots())
-            if (selected) setMeta(await secretMeta(selected.id).catch(() => null))
-          } catch (error) {
-            const body = asAppError(error)
-            toast.error(explain(body.code, body.message, settings.language))
-          }
+          if (!authChallenge) return
+          await attemptConnect(authChallenge.profileId, {
+            serverPassword,
+            keyPassphrase,
+            rememberServerPassword,
+            rememberKeyPassphrase,
+          })
         }}
       />
       <Dialog open={hostKey !== null} onOpenChange={(open) => !open && hostKey && void answerHostKey(false)}>
@@ -897,8 +1012,96 @@ function explain(code: string, fallback: string, language: Language) {
   return known[code] ?? fallback
 }
 
+function RuntimeForwardAdd({
+  language,
+  onAdd,
+}: {
+  language: Language
+  onAdd: (mapping: ForwardMapping, persist: boolean) => Promise<void>
+}) {
+  const zh = language !== "en"
+  const [direction, setDirection] = useState<Direction>("local")
+  const [listenPort, setListenPort] = useState("")
+  const [destinationPort, setDestinationPort] = useState("")
+  const [persist, setPersist] = useState(false)
+  const [pending, setPending] = useState(false)
+
+  return (
+    <div className="flex flex-col gap-3 border-t pt-3">
+      <p className="text-sm font-medium">{zh ? "添加运行时映射" : "Add runtime forward"}</p>
+      <ToggleGroup type="single" value={direction} onValueChange={(value) => value && setDirection(value as Direction)}>
+        <ToggleGroupItem value="local" aria-label={zh ? "本地转发" : "Local forward"}>
+          L
+        </ToggleGroupItem>
+        <ToggleGroupItem value="remote" aria-label={zh ? "远程转发" : "Remote forward"}>
+          R
+        </ToggleGroupItem>
+      </ToggleGroup>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <Field>
+          <FieldLabel htmlFor="runtime-listen">{zh ? "监听端口" : "Listen port"}</FieldLabel>
+          <Input
+            id="runtime-listen"
+            inputMode="numeric"
+            value={listenPort}
+            onChange={(event) => setListenPort(event.target.value)}
+          />
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="runtime-dest">{zh ? "目标端口" : "Destination port"}</FieldLabel>
+          <Input
+            id="runtime-dest"
+            inputMode="numeric"
+            value={destinationPort}
+            onChange={(event) => setDestinationPort(event.target.value)}
+          />
+        </Field>
+      </div>
+      <label className="flex items-center gap-2 text-sm">
+        <Checkbox checked={persist} onCheckedChange={(checked) => setPersist(checked === true)} />
+        {zh ? "同时写入隧道配置" : "Also save in tunnel profile"}
+      </label>
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={pending}
+        onClick={() => {
+          const listen = Number.parseInt(listenPort, 10)
+          const destination = Number.parseInt(destinationPort, 10)
+          if (!Number.isFinite(listen) || !Number.isFinite(destination)) {
+            toast.error(zh ? "请填写有效端口。" : "Enter valid ports.")
+            return
+          }
+          const mapping: ForwardMapping = {
+            id: crypto.randomUUID(),
+            direction,
+            listenHost: "127.0.0.1",
+            listenPort: listen,
+            destinationHost: "127.0.0.1",
+            destinationPort: destination,
+            allowExternal: false,
+          }
+          setPending(true)
+          void onAdd(mapping, persist)
+            .then(() => {
+              setListenPort("")
+              setDestinationPort("")
+            })
+            .catch((error) => toast.error(asAppError(error).message))
+            .finally(() => setPending(false))
+        }}
+      >
+        {pending ? <Spinner data-icon="inline-start" /> : <PlusIcon data-icon="inline-start" />}
+        {zh ? "添加" : "Add"}
+      </Button>
+    </div>
+  )
+}
+
 function ConnectDialog({
   open,
+  challengeCode,
+  challengeMessage,
   language,
   keyringAvailable,
   keyringMessage,
@@ -906,6 +1109,8 @@ function ConnectDialog({
   onSubmit,
 }: {
   open: boolean
+  challengeCode: "password_required" | "passphrase_required" | null
+  challengeMessage: string | null
   language: Language
   keyringAvailable: boolean
   keyringMessage: string | null
@@ -923,7 +1128,9 @@ function ConnectDialog({
   const [rememberServer, setRememberServer] = useState(false)
   const [rememberKey, setRememberKey] = useState(false)
   const [pending, setPending] = useState(false)
-  const title = useMemo(() => (zh ? "连接" : "Connect"), [zh])
+  const needPassword = challengeCode === "password_required"
+  const needPassphrase = challengeCode === "passphrase_required"
+  const title = useMemo(() => (needPassword ? (zh ? "需要服务器密码" : "Server password required") : zh ? "需要私钥口令" : "Key passphrase required"), [needPassword, zh])
 
   useEffect(() => {
     if (!open) {
@@ -940,49 +1147,62 @@ function ConnectDialog({
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           <DialogDescription>
-            {zh
-              ? "服务器密码和私钥口令分开保存。留空表示这次不提供该项，若钥匙串里已有密码则会使用它。"
-              : "The server password and key passphrase are stored separately. Leave a field empty to omit it; a saved password is used when one exists."}
+            {challengeMessage ??
+              (needPassword
+                ? zh
+                  ? "SSH 服务器要求密码。密钥与证书已尝试完毕。"
+                  : "The SSH server wants a password. Keys and certificates were already tried."
+                : zh
+                  ? "需要口令来解密私钥或签名证书。"
+                  : "A passphrase is needed to decrypt the private key or sign the certificate.")}
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
-          <Field>
-            <FieldLabel htmlFor="server-password">{zh ? "服务器密码" : "Server password"}</FieldLabel>
-            <Input
-              id="server-password"
-              type="password"
-              autoComplete="off"
-              value={serverPassword}
-              onChange={(event) => setServerPassword(event.target.value)}
-            />
-          </Field>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox
-              checked={rememberServer && keyringAvailable}
-              disabled={!keyringAvailable}
-              onCheckedChange={(checked) => setRememberServer(checked === true)}
-            />
-            {zh ? "把服务器密码记入系统钥匙串" : "Store the server password in the OS keyring"}
-          </label>
-          <Field>
-            <FieldLabel htmlFor="key-passphrase">{zh ? "私钥口令" : "Key passphrase"}</FieldLabel>
-            <Input
-              id="key-passphrase"
-              type="password"
-              autoComplete="off"
-              value={keyPassphrase}
-              onChange={(event) => setKeyPassphrase(event.target.value)}
-            />
-            <FieldDescription>{zh ? "只用于解开私钥，不会当作服务器密码。" : "Used only to unlock a private key, not as the server password."}</FieldDescription>
-          </Field>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox
-              checked={rememberKey && keyringAvailable}
-              disabled={!keyringAvailable}
-              onCheckedChange={(checked) => setRememberKey(checked === true)}
-            />
-            {zh ? "把私钥口令记入系统钥匙串" : "Store the key passphrase in the OS keyring"}
-          </label>
+          {needPassword ? (
+            <>
+              <Field>
+                <FieldLabel htmlFor="server-password">{zh ? "服务器密码" : "Server password"}</FieldLabel>
+                <Input
+                  id="server-password"
+                  type="password"
+                  autoComplete="off"
+                  value={serverPassword}
+                  onChange={(event) => setServerPassword(event.target.value)}
+                />
+              </Field>
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={rememberServer && keyringAvailable}
+                  disabled={!keyringAvailable}
+                  onCheckedChange={(checked) => setRememberServer(checked === true)}
+                />
+                {zh ? "把服务器密码记入系统钥匙串" : "Store the server password in the OS keyring"}
+              </label>
+            </>
+          ) : null}
+          {needPassphrase ? (
+            <>
+              <Field>
+                <FieldLabel htmlFor="key-passphrase">{zh ? "私钥口令" : "Key passphrase"}</FieldLabel>
+                <Input
+                  id="key-passphrase"
+                  type="password"
+                  autoComplete="off"
+                  value={keyPassphrase}
+                  onChange={(event) => setKeyPassphrase(event.target.value)}
+                />
+                <FieldDescription>{zh ? "只用于解开私钥，不会当作服务器密码。" : "Used only to unlock a private key, not as the server password."}</FieldDescription>
+              </Field>
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={rememberKey && keyringAvailable}
+                  disabled={!keyringAvailable}
+                  onCheckedChange={(checked) => setRememberKey(checked === true)}
+                />
+                {zh ? "把私钥口令记入系统钥匙串" : "Store the key passphrase in the OS keyring"}
+              </label>
+            </>
+          ) : null}
           {!keyringAvailable ? (
             <Alert>
               <AlertTitle>{zh ? "不能记住密码" : "Cannot remember a password"}</AlertTitle>
@@ -998,21 +1218,25 @@ function ConnectDialog({
             {zh ? "取消" : "Cancel"}
           </Button>
           <Button
-            disabled={pending}
+            disabled={pending || (needPassword && !serverPassword.trim()) || (needPassphrase && !keyPassphrase.trim())}
             onClick={() => {
-              const password = serverPassword
-              const passphrase = keyPassphrase
+              const password = needPassword ? serverPassword : null
+              const passphrase = needPassphrase ? keyPassphrase : null
               const rememberPassword = rememberServer
               const rememberPassphrase = rememberKey
               setServerPassword("")
               setKeyPassphrase("")
               setPending(true)
-              void onSubmit(password.trim() ? password : null, passphrase.trim() ? passphrase : null, rememberPassword, rememberPassphrase).finally(
-                () => setPending(false),
-              )
+              void onSubmit(
+                password?.trim() ? password : null,
+                passphrase?.trim() ? passphrase : null,
+                rememberPassword,
+                rememberPassphrase,
+              ).finally(() => setPending(false))
             }}
           >
-            {zh ? "连接" : "Connect"}
+            {pending ? <Spinner data-icon="inline-start" /> : null}
+            {zh ? "继续连接" : "Continue"}
           </Button>
         </DialogFooter>
       </DialogContent>

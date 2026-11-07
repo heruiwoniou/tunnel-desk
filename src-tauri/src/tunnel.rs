@@ -123,7 +123,14 @@ impl ActiveSession {
 
 struct Running {
     session: ActiveSession,
+    live: Arc<LiveRuntime>,
     history_id: String,
+}
+
+struct ForwardRuntime {
+    cancel: CancellationToken,
+    remote: Option<(String, u16)>,
+    local_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub struct TunnelManager {
@@ -204,7 +211,7 @@ impl TunnelManager {
             let _ = self.store.save_trust(&trust);
         }
         match result {
-            Ok(session) => {
+            Ok((session, live)) => {
                 let snapshot = session.snapshot();
                 let history_id = crate::model::new_id();
                 self.store.push_history(HistoryEntry {
@@ -222,6 +229,7 @@ impl TunnelManager {
                     profile.id.clone(),
                     Running {
                         session,
+                        live,
                         history_id,
                     },
                 );
@@ -313,6 +321,78 @@ impl TunnelManager {
         }
         self.publish();
         Ok(())
+    }
+
+    pub async fn add_runtime_forward(
+        &self,
+        profile_id: &str,
+        mapping: &crate::model::ForwardMapping,
+        persist: bool,
+    ) -> Result<TunnelSnapshot, AppError> {
+        let forward = crate::forward::validate_mapping(mapping)?;
+        let live = {
+            let running = self.running.lock().expect("running");
+            let Some(running) = running.get(profile_id) else {
+                return Err(AppError::new("not_connected", "隧道未连接，无法添加映射"));
+            };
+            if running.session.snapshot().phase != Phase::Connected {
+                return Err(AppError::new("not_connected", "隧道未处于已连接状态"));
+            }
+            Arc::clone(&running.live)
+        };
+        live.add_forward(forward).await?;
+        if persist {
+            let mut profiles = self.store.load_profiles()?;
+            let Some(profile) = profiles.iter_mut().find(|item| item.id == profile_id) else {
+                return Err(AppError::new("not_found", "找不到这条隧道"));
+            };
+            if !profile.forwards.iter().any(|item| item.id == mapping.id) {
+                profile.forwards.push(mapping.clone());
+            }
+            self.store.save_profiles(&profiles)?;
+        }
+        self.publish();
+        Ok(self
+            .running
+            .lock()
+            .expect("running")
+            .get(profile_id)
+            .expect("running")
+            .session
+            .snapshot())
+    }
+
+    pub async fn remove_runtime_forward(
+        &self,
+        profile_id: &str,
+        forward_id: &str,
+        persist: bool,
+    ) -> Result<TunnelSnapshot, AppError> {
+        let live = {
+            let running = self.running.lock().expect("running");
+            let Some(running) = running.get(profile_id) else {
+                return Err(AppError::new("not_connected", "隧道未连接，无法移除映射"));
+            };
+            Arc::clone(&running.live)
+        };
+        live.remove_forward(forward_id).await?;
+        if persist {
+            let mut profiles = self.store.load_profiles()?;
+            let Some(profile) = profiles.iter_mut().find(|item| item.id == profile_id) else {
+                return Err(AppError::new("not_found", "找不到这条隧道"));
+            };
+            profile.forwards.retain(|item| item.id != forward_id);
+            self.store.save_profiles(&profiles)?;
+        }
+        self.publish();
+        Ok(self
+            .running
+            .lock()
+            .expect("running")
+            .get(profile_id)
+            .expect("running")
+            .session
+            .snapshot())
     }
 
     pub async fn disconnect_all(&self) -> Result<(), AppError> {
@@ -719,7 +799,7 @@ pub async fn start_session(
     prompter: Arc<dyn HostKeyPrompter>,
     trust_path: PathBuf,
     trust: Arc<Mutex<TrustStore>>,
-) -> Result<ActiveSession, AppError> {
+) -> Result<StartedSession, AppError> {
     if spec.hops.is_empty() {
         return Err(AppError::new("invalid_target", "没有可连接的主机"));
     }
@@ -741,6 +821,7 @@ pub async fn start_session(
     let cancel = CancellationToken::new();
     let done = Arc::new(tokio::sync::Notify::new());
     let (ready_tx, ready_rx) = oneshot::channel();
+    let (live_tx, live_rx) = oneshot::channel::<Arc<LiveRuntime>>();
     let task_snapshot = snapshot.clone();
     let task_cancel = cancel.clone();
     let task_done = done.clone();
@@ -756,20 +837,22 @@ pub async fn start_session(
         .await;
         match outcome {
             Ok(runtime) => {
+                let runtime = Arc::new(runtime);
                 set_phase(
                     &task_snapshot,
                     Phase::Connected,
                     "认证成功，端口映射已绑定",
                     None,
                 );
+                let _ = live_tx.send(Arc::clone(&runtime));
                 let _ = ready_tx.send(Ok(()));
                 tokio::select! {
                     _ = task_cancel.cancelled() => {
-                        cleanup(runtime, false).await;
+                        cleanup_shared(runtime, false).await;
                         set_phase(&task_snapshot, Phase::Disconnected, "已断开", None);
                     }
                     _ = runtime.lost.notified() => {
-                        cleanup(runtime, true).await;
+                        cleanup_shared(runtime, true).await;
                         set_phase(&task_snapshot, Phase::Failed, "SSH 连接已中断", None);
                     }
                 }
@@ -782,23 +865,174 @@ pub async fn start_session(
         task_done.notify_one();
     });
     match ready_rx.await {
-        Ok(Ok(())) => Ok(ActiveSession {
-            snapshot,
-            cancel,
-            done,
-        }),
+        Ok(Ok(())) => {
+            let live = live_rx
+                .await
+                .map_err(|_| AppError::new("ssh", "连接任务未返回会话句柄"))?;
+            Ok((
+                ActiveSession {
+                    snapshot,
+                    cancel,
+                    done,
+                },
+                live,
+            ))
+        }
         Ok(Err(err)) => Err(err),
         Err(_) => Err(AppError::new("ssh", "连接任务意外结束")),
     }
 }
 
+pub(crate) type StartedSession = (ActiveSession, Arc<LiveRuntime>);
+
 struct LiveRuntime {
     handle: Arc<tokio::sync::Mutex<client::Handle<ClientHandler>>>,
     kept: Vec<client::Handle<ClientHandler>>,
     proxies: Vec<tokio::process::Child>,
-    remote_started: Vec<(String, u16)>,
+    remote_rules: Arc<Mutex<Vec<RemoteRule>>>,
+    remote_started: Mutex<Vec<(String, u16)>>,
+    forwards: Mutex<HashMap<String, ForwardRuntime>>,
+    snapshot: Arc<Mutex<TunnelSnapshot>>,
     lost: Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
+}
+
+impl LiveRuntime {
+    async fn add_forward(&self, forward: ValidatedForward) -> Result<(), AppError> {
+        {
+            let snap = self.snapshot.lock().expect("snapshot");
+            if snap.forwards.iter().any(|item| item.id == forward.id) {
+                return Err(AppError::new(
+                    "forward_exists",
+                    format!("映射 {} 已在运行", forward.id),
+                ));
+            }
+        }
+        let per_forward = CancellationToken::new();
+        match forward.direction {
+            Direction::Local => {
+                let listener =
+                    match TcpListener::bind((forward.listen_ip, forward.listen_port)).await {
+                        Ok(listener) => listener,
+                        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                            return Err(AppError::new(
+                                "port_in_use",
+                                format!("本地端口 {} 已被占用", forward.listen_port),
+                            ));
+                        }
+                        Err(err) => {
+                            return Err(AppError::new(
+                                "bind_failed",
+                                format!("无法绑定本地端口 {}: {err}", forward.listen_port),
+                            ));
+                        }
+                    };
+                let handle = self.handle.clone();
+                let loop_cancel = per_forward.clone();
+                let validated = forward.clone();
+                let local_task = tokio::spawn(async move {
+                    local_accept_loop(listener, handle, validated, loop_cancel).await;
+                });
+                self.upsert_forward_status(&forward, "listening", "本地监听已绑定", None)
+                    .await?;
+                self.forwards.lock().expect("forwards").insert(
+                    forward.id.clone(),
+                    ForwardRuntime {
+                        cancel: per_forward,
+                        remote: None,
+                        local_task: Some(local_task),
+                    },
+                );
+                return Ok(());
+            }
+            Direction::Remote => {
+                let address = forward.listen_ip.to_string();
+                {
+                    let handle = self.handle.lock().await;
+                    match handle
+                        .tcpip_forward(address.clone(), u32::from(forward.listen_port))
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(err) => return Err(AppError::from(err)),
+                    }
+                }
+                self.remote_rules.lock().expect("rules").push(RemoteRule {
+                    listen_port: forward.listen_port,
+                    destination_host: forward.destination_host.clone(),
+                    destination_port: forward.destination_port,
+                });
+                self.upsert_forward_status(
+                    &forward,
+                    "listening",
+                    "服务器已接受远程转发",
+                    Some((address, forward.listen_port)),
+                )
+                .await?;
+            }
+        }
+        if forward.direction == Direction::Remote {
+            self.forwards.lock().expect("forwards").insert(
+                forward.id.clone(),
+                ForwardRuntime {
+                    cancel: per_forward,
+                    remote: Some((forward.listen_ip.to_string(), forward.listen_port)),
+                    local_task: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn remove_forward(&self, forward_id: &str) -> Result<(), AppError> {
+        let runtime = self
+            .forwards
+            .lock()
+            .expect("forwards")
+            .remove(forward_id)
+            .ok_or_else(|| AppError::new("not_found", "找不到这条运行中的映射"))?;
+        runtime.cancel.cancel();
+        if let Some(task) = runtime.local_task {
+            task.abort();
+        }
+        if let Some((address, port)) = runtime.remote {
+            let handle = self.handle.lock().await;
+            let _ = handle
+                .cancel_tcpip_forward(address.clone(), u32::from(port))
+                .await;
+            self.remote_started
+                .lock()
+                .expect("remote")
+                .retain(|item| item.0 != address || item.1 != port);
+            self.remote_rules
+                .lock()
+                .expect("rules")
+                .retain(|rule| rule.listen_port != port);
+        }
+        let mut snap = self.snapshot.lock().expect("snapshot");
+        snap.forwards.retain(|item| item.id != forward_id);
+        Ok(())
+    }
+
+    async fn upsert_forward_status(
+        &self,
+        forward: &ValidatedForward,
+        state: &str,
+        message: &str,
+        remote: Option<(String, u16)>,
+    ) -> Result<(), AppError> {
+        let status = forward_status(forward, state, message);
+        let mut snap = self.snapshot.lock().expect("snapshot");
+        if let Some(existing) = snap.forwards.iter_mut().find(|item| item.id == forward.id) {
+            *existing = status;
+        } else {
+            snap.forwards.push(status);
+        }
+        if let Some(pair) = remote {
+            self.remote_started.lock().expect("remote").push(pair);
+        }
+        Ok(())
+    }
 }
 
 async fn run_session(
@@ -815,6 +1049,17 @@ async fn run_session(
     let mut proxies = Vec::new();
     let mut current: Option<client::Handle<ClientHandler>> = None;
     let hop_count = spec.hops.len();
+    let shared_remote_rules = Arc::new(Mutex::new(
+        spec.forwards
+            .iter()
+            .filter(|forward| forward.direction == Direction::Remote)
+            .map(|forward| RemoteRule {
+                listen_port: forward.listen_port,
+                destination_host: forward.destination_host.clone(),
+                destination_port: forward.destination_port,
+            })
+            .collect::<Vec<_>>(),
+    ));
     for (index, endpoint) in spec.hops.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(AppError::new("cancelled", "连接已取消"));
@@ -830,17 +1075,9 @@ async fn run_session(
             trust_path: trust_path.clone(),
             prompter: prompter.clone(),
             remote_rules: if last {
-                spec.forwards
-                    .iter()
-                    .filter(|forward| forward.direction == Direction::Remote)
-                    .map(|forward| RemoteRule {
-                        listen_port: forward.listen_port,
-                        destination_host: forward.destination_host.clone(),
-                        destination_port: forward.destination_port,
-                    })
-                    .collect()
+                Arc::clone(&shared_remote_rules)
             } else {
-                Vec::new()
+                Arc::new(Mutex::new(Vec::new()))
             },
             accept_forwards: last,
             cancel: cancel.clone(),
@@ -932,18 +1169,46 @@ async fn run_session(
         snap.forwards = statuses;
         snap.connected_at = Some(now_rfc3339());
     }
+    let mut forward_runtimes = HashMap::new();
     for (listener, forward) in listeners {
-        let shared = shared.clone();
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            local_accept_loop(listener, shared, forward, cancel).await;
+        let per_forward = CancellationToken::new();
+        let shared_handle = shared.clone();
+        let loop_cancel = per_forward.clone();
+        let validated = forward.clone();
+        let local_task = tokio::spawn(async move {
+            local_accept_loop(listener, shared_handle, validated, loop_cancel).await;
         });
+        forward_runtimes.insert(
+            forward.id.clone(),
+            ForwardRuntime {
+                cancel: per_forward,
+                remote: None,
+                local_task: Some(local_task),
+            },
+        );
+    }
+    for forward in spec
+        .forwards
+        .iter()
+        .filter(|forward| forward.direction == Direction::Remote)
+    {
+        forward_runtimes.insert(
+            forward.id.clone(),
+            ForwardRuntime {
+                cancel: CancellationToken::new(),
+                remote: Some((forward.listen_ip.to_string(), forward.listen_port)),
+                local_task: None,
+            },
+        );
     }
     Ok(LiveRuntime {
         handle: shared,
         kept,
         proxies,
-        remote_started,
+        remote_rules: shared_remote_rules,
+        remote_started: Mutex::new(remote_started),
+        forwards: Mutex::new(forward_runtimes),
+        snapshot: snapshot.clone(),
         lost,
         cancel,
     })
@@ -1031,10 +1296,24 @@ async fn local_accept_loop(
     }
 }
 
-async fn cleanup(runtime: LiveRuntime, failed: bool) {
+async fn cleanup_shared(runtime: Arc<LiveRuntime>, failed: bool) {
     runtime.cancel.cancel();
+    let forwards: Vec<ForwardRuntime> = runtime
+        .forwards
+        .lock()
+        .expect("forwards")
+        .drain()
+        .map(|(_, runtime)| runtime)
+        .collect();
+    for forward_runtime in forwards {
+        forward_runtime.cancel.cancel();
+        if let Some(task) = forward_runtime.local_task {
+            task.abort();
+        }
+    }
     let handle = runtime.handle.lock().await;
-    for (address, port) in &runtime.remote_started {
+    let remote_started = runtime.remote_started.lock().expect("remote").clone();
+    for (address, port) in &remote_started {
         let _ = handle
             .cancel_tcpip_forward(address.clone(), u32::from(*port))
             .await;
@@ -1051,10 +1330,12 @@ async fn cleanup(runtime: LiveRuntime, failed: bool) {
         )
         .await;
     drop(handle);
-    for hop in runtime.kept {
-        let _ = hop.disconnect(Disconnect::ByApplication, "", "en").await;
+    if let Ok(runtime) = Arc::try_unwrap(runtime) {
+        for hop in runtime.kept {
+            let _ = hop.disconnect(Disconnect::ByApplication, "", "en").await;
+        }
+        drop(runtime.proxies);
     }
-    drop(runtime.proxies);
 }
 
 fn client_config() -> client::Config {
@@ -1101,7 +1382,7 @@ struct ClientHandler {
     trust: Arc<Mutex<TrustStore>>,
     trust_path: PathBuf,
     prompter: Arc<dyn HostKeyPrompter>,
-    remote_rules: Vec<RemoteRule>,
+    remote_rules: Arc<Mutex<Vec<RemoteRule>>>,
     accept_forwards: bool,
     cancel: CancellationToken,
     session_lost: Arc<tokio::sync::Notify>,
@@ -1195,12 +1476,14 @@ impl Handler for ClientHandler {
             drop(reply);
             return Ok(());
         }
-        let Some(rule) = self
-            .remote_rules
-            .iter()
-            .find(|rule| u32::from(rule.listen_port) == connected_port)
-            .cloned()
-        else {
+        let rule = {
+            let rules = self.remote_rules.lock().expect("rules");
+            rules
+                .iter()
+                .find(|rule| u32::from(rule.listen_port) == connected_port)
+                .cloned()
+        };
+        let Some(rule) = rule else {
             drop(reply);
             return Ok(());
         };

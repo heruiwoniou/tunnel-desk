@@ -9,6 +9,10 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- On-demand SSH credential prompts after keys, certificates, the agent, and saved
+  secrets are tried. The connect flow no longer opens a password dialog first.
+- Runtime add and remove of local and remote port forwards on an active tunnel,
+  with optional persistence to the profile.
 - OpenSSH user certificates from `~/.ssh/config`. Explicit `CertificateFile`
   entries are paired with the matching `IdentityFile`, and `<identity>-cert.pub`
   is discovered automatically when no `CertificateFile` is set. An unlocked
@@ -19,6 +23,8 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Tunnel detail layout: clearer spacing, live forward status, and focused
+  authentication dialogs with loading states and keyboard-friendly controls.
 - `PubkeyAuthentication`, `HostKeyAlias`, and `RevokedHostKeys` are read from
   the resolved host. `IdentitiesOnly` still limits which agent keys are offered.
   Expired, not-yet-valid, mismatched, and unsupported certificates report their
@@ -27,6 +33,8 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Tray “Show window” and left-click restore focus on Linux when returning from
+  the status icon after hide-to-tray.
 - `RevokedHostKeys` is read as one OpenSSH public key per line. A listed host
   key, certificate subject, or signing CA is rejected even when `known_hosts`
   would otherwise trust it. A KRL or a line that is not a public key fails

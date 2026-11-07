@@ -1356,3 +1356,69 @@ async fn openssh_refused_destination_keeps_the_session() {
     manager.disconnect("partial").await.unwrap();
     assert_no_secret(dir.path(), &server.password);
 }
+
+#[tokio::test]
+async fn openssh_runtime_forward_add_remove() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let initial = free_port();
+    let added = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    connect_alias(
+        &manager,
+        "runtime",
+        vec![mapping(Direction::Local, initial, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    exchange(SocketAddr::from(([127, 0, 0, 1], initial)), b"initial").await;
+    let extra = mapping(Direction::Local, added, echo.port());
+    manager
+        .add_runtime_forward("runtime", &extra, false)
+        .await
+        .unwrap();
+    assert_eq!(manager.snapshots()[0].forwards.len(), 2);
+    exchange(SocketAddr::from(([127, 0, 0, 1], added)), b"added-live").await;
+    let removed_id = manager.snapshots()[0]
+        .forwards
+        .iter()
+        .find(|item| item.id == extra.id)
+        .expect("added forward")
+        .id
+        .clone();
+    manager
+        .remove_runtime_forward("runtime", &removed_id, false)
+        .await
+        .unwrap();
+    assert_eq!(manager.snapshots()[0].forwards.len(), 1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let dead = exchange_once(SocketAddr::from(([127, 0, 0, 1], added)), b"nope").await;
+    assert!(
+        dead.is_err(),
+        "removed listener should not accept traffic: {dead:?}"
+    );
+    exchange(SocketAddr::from(([127, 0, 0, 1], initial)), b"still-there").await;
+    manager.disconnect("runtime").await.unwrap();
+}

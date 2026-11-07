@@ -5,6 +5,7 @@ import type {
   AppErrorBody,
   BackendInfo,
   ConnectRequest,
+  ForwardMapping,
   HistoryEntry,
   HostKeyEvent,
   Profile,
@@ -137,6 +138,18 @@ export function disconnectProfile(profileId: string) {
 
 export function disconnectAll() {
   return invoke<void>("disconnect_all")
+}
+
+export function addRuntimeForward(profileId: string, mapping: ForwardMapping, persist: boolean) {
+  return invoke<TunnelSnapshot>("add_runtime_forward", {
+    request: { profileId, mapping, persist },
+  })
+}
+
+export function removeRuntimeForward(profileId: string, forwardId: string, persist: boolean) {
+  return invoke<TunnelSnapshot>("remove_runtime_forward", {
+    request: { profileId, forwardId, persist },
+  })
 }
 
 export function respondHostKey(requestId: string, accept: boolean) {

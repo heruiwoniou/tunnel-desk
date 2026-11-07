@@ -256,6 +256,52 @@ async fn disconnect_all(app: AppHandle, state: State<'_, AppState>) -> Result<()
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeForwardRequest {
+    profile_id: String,
+    mapping: crate::model::ForwardMapping,
+    persist: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeForwardRemove {
+    profile_id: String,
+    forward_id: String,
+    persist: bool,
+}
+
+#[tauri::command]
+async fn add_runtime_forward(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RuntimeForwardRequest,
+) -> Result<TunnelSnapshot, AppError> {
+    let snapshot = state
+        .manager
+        .add_runtime_forward(&request.profile_id, &request.mapping, request.persist)
+        .await?;
+    crate::tray::refresh(&state);
+    let _ = app.emit("tunnel-state", state.manager.snapshots());
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn remove_runtime_forward(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RuntimeForwardRemove,
+) -> Result<TunnelSnapshot, AppError> {
+    let snapshot = state
+        .manager
+        .remove_runtime_forward(&request.profile_id, &request.forward_id, request.persist)
+        .await?;
+    crate::tray::refresh(&state);
+    let _ = app.emit("tunnel-state", state.manager.snapshots());
+    Ok(snapshot)
+}
+
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         backend_info,
@@ -277,7 +323,9 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         respond_host_key,
         connect_profile,
         disconnect_profile,
-        disconnect_all
+        disconnect_all,
+        add_runtime_forward,
+        remove_runtime_forward,
     ]
 }
 
@@ -298,23 +346,16 @@ pub async fn connect_from_tray(
         Ok(_) => {
             let _ = app.emit("tunnel-state", manager.snapshots());
         }
-        Err(err)
-            if err.code == "password_required"
-                || err.code == "passphrase_required"
-                || err.code == "host_key_rejected" =>
-        {
+        Err(err) if err.code == "password_required" || err.code == "passphrase_required" => {
             reveal(app);
             let _ = app.emit(
                 "connect-needs-input",
                 serde_json::json!({ "profileId": profile_id, "code": err.code, "message": err.message }),
             );
         }
-        Err(err) => {
+        Err(_) => {
             reveal(app);
-            let _ = app.emit(
-                "connect-needs-input",
-                serde_json::json!({ "profileId": profile_id, "code": err.code, "message": err.message }),
-            );
+            let _ = app.emit("tunnel-state", manager.snapshots());
         }
     }
 }
@@ -323,6 +364,11 @@ pub fn reveal(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_always_on_top(false);
+        }
         let _ = window.set_focus();
     }
 }
