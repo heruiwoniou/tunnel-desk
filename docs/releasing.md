@@ -59,6 +59,9 @@ from the Actions tab. It does not create tags or GitHub Releases.
 
 The checks job runs actionlint 1.7.12, shellcheck, frontend lint, typecheck,
 Vitest, `version:check`, `cargo fmt --check`, and `cargo test --locked`.
+Windows and both macOS package jobs also run `cargo test`. The disposable
+OpenSSH `sshd` tests need Linux `useradd`, so they run on Ubuntu and are
+skipped on macOS and Windows.
 
 The package job builds installers and uploads them as workflow artifacts:
 
