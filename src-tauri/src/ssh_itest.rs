@@ -757,3 +757,191 @@ async fn cancel_during_slow_password_auth_converges_quickly() {
     assert!(matches!(outcome, Err(err) if err.code == "cancelled"));
     assert!(manager.snapshots().is_empty());
 }
+
+#[tokio::test]
+async fn rejected_challenge_tickets_do_not_block_retry() {
+    let secret = fake_secret();
+    let echo = echo_server().await;
+    let ssh = ssh_server(secret.clone(), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    );
+    let listen = free_port();
+    let item = profile(
+        "ticket",
+        ssh.port(),
+        vec![mapping(Direction::Local, listen, echo.port())],
+        false,
+    );
+    let challenge = save_and_connect(&manager, &item, None, false, Arc::new(FixedPrompter(true)))
+        .await
+        .expect_err("password required first");
+    assert_eq!(challenge.code, "password_required");
+    let ticket = challenge
+        .challenge_id
+        .clone()
+        .expect("challenge id on pending auth");
+    let endpoint = challenge
+        .challenge_endpoint
+        .clone()
+        .expect("challenge endpoint");
+    let missing = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            None,
+            Some(endpoint.clone()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("missing ticket");
+    assert_eq!(missing.code, "challenge_id_required");
+    let missing_again = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            None,
+            Some(endpoint.clone()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("still missing ticket");
+    assert_eq!(missing_again.code, "challenge_id_required");
+    let stale = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            Some("stale-ticket".into()),
+            Some(endpoint.clone()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("wrong ticket");
+    assert_eq!(stale.code, "challenge_stale");
+    let mismatch = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            Some(ticket.clone()),
+            Some("other@127.0.0.1:9".into()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("wrong endpoint");
+    assert_eq!(mismatch.code, "challenge_mismatch");
+    manager
+        .connect_challenge_response(
+            "ticket",
+            &challenge,
+            Some(Zeroizing::new(secret.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("valid ticket should connect without cancel");
+    manager.disconnect("ticket").await.unwrap();
+}
+
+#[tokio::test]
+async fn challenge_rejection_on_one_profile_does_not_block_another() {
+    let secret = fake_secret();
+    let echo = echo_server().await;
+    let ssh = ssh_server(secret.clone(), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    );
+    let listen_a = free_port();
+    let listen_b = free_port();
+    let item_a = profile(
+        "ticket-a",
+        ssh.port(),
+        vec![mapping(Direction::Local, listen_a, echo.port())],
+        false,
+    );
+    let item_b = profile(
+        "ticket-b",
+        ssh.port(),
+        vec![mapping(Direction::Local, listen_b, echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item_a, item_b]).unwrap();
+    let challenge_a = manager
+        .connect(
+            "ticket-a",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("a needs password");
+    assert_eq!(challenge_a.code, "password_required");
+    let blocked = manager
+        .connect_with_challenge(
+            "ticket-a",
+            None,
+            None,
+            false,
+            false,
+            challenge_a.challenge_host.clone(),
+            Some("stale".into()),
+            challenge_a.challenge_endpoint.clone(),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("stale ticket on a");
+    assert_eq!(blocked.code, "challenge_stale");
+    manager
+        .connect(
+            "ticket-b",
+            Some(Zeroizing::new(secret.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("profile b should connect while a waits for credentials");
+    manager
+        .connect_challenge_response(
+            "ticket-a",
+            &challenge_a,
+            Some(Zeroizing::new(secret)),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("profile a resumes without cancel");
+    manager.disconnect_all().await.unwrap();
+}

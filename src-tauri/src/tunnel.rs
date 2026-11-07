@@ -170,6 +170,42 @@ fn pending_auth_ticket(
     }
 }
 
+fn validate_pending_challenge(
+    pending: &PendingAuth,
+    challenge_id: Option<&String>,
+    challenge_endpoint: Option<&str>,
+) -> Result<(), AppError> {
+    let hop = &pending.hops[pending.hop_index];
+    let hop_kind = if pending.hop_index + 1 == pending.hops.len() {
+        "target"
+    } else {
+        "jump"
+    };
+    let ticket = &pending.challenge_id;
+    let endpoint_key = endpoint_credential_key(hop);
+    let Some(submitted) = challenge_id else {
+        return Err(
+            AppError::new("challenge_id_required", "需要最新的认证挑战编号才能继续")
+                .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket),
+        );
+    };
+    if submitted != ticket {
+        return Err(
+            AppError::new("challenge_stale", "该认证挑战已过期，请使用最新提示重试")
+                .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket),
+        );
+    }
+    if let Some(submitted_endpoint) = challenge_endpoint {
+        if submitted_endpoint != endpoint_key {
+            return Err(
+                AppError::new("challenge_mismatch", "凭据与当前认证目标不匹配")
+                    .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn attach_pending_challenge(
     mut pending: PendingAuth,
     err: AppError,
@@ -425,59 +461,24 @@ impl TunnelManager {
         let mut spec = self.spec_for_profile(&profile, password.clone(), passphrase.clone())?;
         let secret_view = secret_view(&spec);
         let trust = Arc::new(Mutex::new(self.store.load_trust()?));
-        let connect_cancel = CancellationToken::new();
-        self.inflight
-            .lock()
-            .expect("inflight")
-            .insert(profile_id.to_string(), connect_cancel.clone());
         let pending_resume = self
             .pending_auth
             .lock()
             .expect("pending")
             .remove(profile_id);
-        let result = if let Some(mut pending) = pending_resume {
+        let prepared_pending = if let Some(mut pending) = pending_resume {
+            if let Err(err) = validate_pending_challenge(
+                &pending,
+                challenge_id.as_ref(),
+                challenge_endpoint.as_deref(),
+            ) {
+                self.pending_auth
+                    .lock()
+                    .expect("pending")
+                    .insert(profile_id.to_string(), pending);
+                return Err(err);
+            }
             let hop = pending.hops[pending.hop_index].clone();
-            let hop_kind = if pending.hop_index + 1 == pending.hops.len() {
-                "target"
-            } else {
-                "jump"
-            };
-            let ticket = pending.challenge_id.clone();
-            let endpoint_key = endpoint_credential_key(&hop);
-            let Some(submitted) = challenge_id else {
-                self.pending_auth
-                    .lock()
-                    .expect("pending")
-                    .insert(profile_id.to_string(), pending);
-                return Err(AppError::new(
-                    "challenge_id_required",
-                    "需要最新的认证挑战编号才能继续",
-                )
-                .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket));
-            };
-            if submitted != ticket {
-                self.pending_auth
-                    .lock()
-                    .expect("pending")
-                    .insert(profile_id.to_string(), pending);
-                return Err(AppError::new(
-                    "challenge_stale",
-                    "该认证挑战已过期，请使用最新提示重试",
-                )
-                .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket));
-            }
-            if let Some(submitted_endpoint) = challenge_endpoint.as_deref() {
-                if submitted_endpoint != endpoint_key {
-                    self.pending_auth
-                        .lock()
-                        .expect("pending")
-                        .insert(profile_id.to_string(), pending);
-                    return Err(
-                        AppError::new("challenge_mismatch", "凭据与当前认证目标不匹配")
-                            .with_challenge_ticket(&hop.host, hop_kind, endpoint_key, ticket),
-                    );
-                }
-            }
             if let Some(value) = spec.password.clone() {
                 pending.spec.password = Some(value);
             }
@@ -486,7 +487,7 @@ impl TunnelManager {
             } else if let Some(phrase) = spec.passphrase.clone() {
                 pending.spec.merge_passphrase_for(&hop, phrase);
             }
-            continue_pending_session(pending, prompter, connect_cancel).await
+            Some(pending)
         } else {
             if challenge_id.is_some() {
                 return Err(AppError::new(
@@ -494,6 +495,17 @@ impl TunnelManager {
                     "没有进行中的认证会话可继续",
                 ));
             }
+            None
+        };
+        let connect_cancel = CancellationToken::new();
+        self.inflight
+            .lock()
+            .expect("inflight")
+            .insert(profile_id.to_string(), connect_cancel.clone());
+        let result = if let Some(pending) = prepared_pending {
+            let _ = challenge_host;
+            continue_pending_session(pending, prompter, connect_cancel).await
+        } else {
             let _ = challenge_host;
             start_session(
                 spec,
