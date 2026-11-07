@@ -99,6 +99,9 @@ struct TestServer {
     user: String,
     password: String,
     refuse_forward: bool,
+    refuse_cancel_forward: bool,
+    auth_hold: Option<Arc<tokio::sync::Notify>>,
+    auth_delay: Duration,
     forwards: Arc<Mutex<std::collections::HashMap<u16, CancellationToken>>>,
 }
 
@@ -113,6 +116,10 @@ impl Handler for TestServer {
     type Error = russh::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if let Some(hold) = &self.auth_hold {
+            hold.notify_one();
+            tokio::time::sleep(self.auth_delay).await;
+        }
         if user == self.user && password.as_bytes() == self.password.as_bytes() {
             Ok(Auth::Accept)
         } else {
@@ -206,6 +213,9 @@ impl Handler for TestServer {
         port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        if self.refuse_cancel_forward {
+            return Ok(false);
+        }
         if let Ok(port) = u16::try_from(port)
             && let Some(token) = self.forwards.lock().expect("forwards").remove(&port)
         {
@@ -335,6 +345,31 @@ async fn echo_server() -> SocketAddr {
 }
 
 async fn ssh_server(password: String, refuse_forward: bool) -> SocketAddr {
+    ssh_server_opts(password, refuse_forward, false).await
+}
+
+async fn ssh_server_opts(
+    password: String,
+    refuse_forward: bool,
+    refuse_cancel_forward: bool,
+) -> SocketAddr {
+    ssh_server_delayed(
+        password,
+        refuse_forward,
+        refuse_cancel_forward,
+        None,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn ssh_server_delayed(
+    password: String,
+    refuse_forward: bool,
+    refuse_cancel_forward: bool,
+    auth_hold: Option<Arc<tokio::sync::Notify>>,
+    auth_delay: Duration,
+) -> SocketAddr {
     let mut config = russh::server::Config::default();
     config.auth_rejection_time = Duration::from_millis(1);
     config.auth_rejection_time_initial = Some(Duration::from_millis(1));
@@ -353,6 +388,9 @@ async fn ssh_server(password: String, refuse_forward: bool) -> SocketAddr {
         user: "tdtest".into(),
         password,
         refuse_forward,
+        refuse_cancel_forward,
+        auth_hold,
+        auth_delay,
         forwards: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
     tokio::spawn(async move {
@@ -574,7 +612,8 @@ async fn rejects_bad_password_changed_key_occupied_port_and_forward_refusal() {
         Arc::new(FixedPrompter(true)),
     )
     .await;
-    assert_eq!(wrong.unwrap_err().code, "auth_failed");
+    assert_eq!(wrong.unwrap_err().code, "password_rejected");
+    manager.cancel_connect("bad").await.unwrap();
     TcpListener::bind(("127.0.0.1", local_port))
         .await
         .expect("failed auth left no listener");
@@ -611,4 +650,298 @@ async fn rejects_bad_password_changed_key_occupied_port_and_forward_refusal() {
     .await;
     assert_eq!(denied.unwrap_err().code, "forward_denied");
     assert_no_secret(dir.path(), &secret);
+}
+
+#[tokio::test]
+async fn remote_forward_remove_reports_cancel_failure_and_keeps_mapping() {
+    let secret = fake_secret();
+    let echo = echo_server().await;
+    let ssh = ssh_server_opts(secret.clone(), false, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    );
+    let remote_port = free_port();
+    let item = profile(
+        "remote-cancel",
+        ssh.port(),
+        vec![mapping(Direction::Remote, remote_port, echo.port())],
+        false,
+    );
+    save_and_connect(
+        &manager,
+        &item,
+        Some(&secret),
+        false,
+        Arc::new(FixedPrompter(true)),
+    )
+    .await
+    .expect("connect");
+    exchange(
+        SocketAddr::from(([127, 0, 0, 1], remote_port)),
+        b"remote-before",
+    )
+    .await;
+    let forward_id = manager.snapshots()[0].forwards[0].id.clone();
+    let err = manager
+        .remove_runtime_forward("remote-cancel", &forward_id, false)
+        .await
+        .expect_err("server refused cancel");
+    assert_eq!(err.code, "forward_cancel_failed");
+    assert_eq!(manager.snapshots()[0].forwards.len(), 1);
+    exchange(
+        SocketAddr::from(([127, 0, 0, 1], remote_port)),
+        b"remote-still",
+    )
+    .await;
+    manager.disconnect("remote-cancel").await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_during_slow_password_auth_converges_quickly() {
+    let secret = fake_secret();
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let ssh = ssh_server_delayed(
+        secret.clone(),
+        false,
+        false,
+        Some(Arc::clone(&hold)),
+        Duration::from_secs(30),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    ));
+    let item = profile(
+        "slow-auth",
+        ssh.port(),
+        vec![mapping(
+            Direction::Local,
+            free_port(),
+            echo_server().await.port(),
+        )],
+        false,
+    );
+    let need = save_and_connect(&manager, &item, None, false, Arc::new(FixedPrompter(true)))
+        .await
+        .expect_err("password required");
+    assert_eq!(need.code, "password_required");
+    let mgr = Arc::clone(&manager);
+    let join = tokio::spawn(async move {
+        mgr.connect_challenge_response(
+            "slow-auth",
+            &need,
+            Some(Zeroizing::new(secret.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+    });
+    hold.notified().await;
+    manager.cancel_connect("slow-auth").await.unwrap();
+    let finished = tokio::time::timeout(Duration::from_secs(3), join).await;
+    let outcome = finished
+        .expect("cancel should finish promptly")
+        .expect("join");
+    assert!(matches!(outcome, Err(err) if err.code == "cancelled"));
+    assert!(manager.snapshots().is_empty());
+}
+
+#[tokio::test]
+async fn rejected_challenge_tickets_do_not_block_retry() {
+    let secret = fake_secret();
+    let echo = echo_server().await;
+    let ssh = ssh_server(secret.clone(), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    );
+    let listen = free_port();
+    let item = profile(
+        "ticket",
+        ssh.port(),
+        vec![mapping(Direction::Local, listen, echo.port())],
+        false,
+    );
+    let challenge = save_and_connect(&manager, &item, None, false, Arc::new(FixedPrompter(true)))
+        .await
+        .expect_err("password required first");
+    assert_eq!(challenge.code, "password_required");
+    let ticket = challenge
+        .challenge_id
+        .clone()
+        .expect("challenge id on pending auth");
+    let endpoint = challenge
+        .challenge_endpoint
+        .clone()
+        .expect("challenge endpoint");
+    let missing = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            None,
+            Some(endpoint.clone()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("missing ticket");
+    assert_eq!(missing.code, "challenge_id_required");
+    let missing_again = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            None,
+            Some(endpoint.clone()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("still missing ticket");
+    assert_eq!(missing_again.code, "challenge_id_required");
+    let stale = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            Some("stale-ticket".into()),
+            Some(endpoint.clone()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("wrong ticket");
+    assert_eq!(stale.code, "challenge_stale");
+    let mismatch = manager
+        .connect_with_challenge(
+            "ticket",
+            None,
+            None,
+            false,
+            false,
+            challenge.challenge_host.clone(),
+            Some(ticket.clone()),
+            Some("other@127.0.0.1:9".into()),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("wrong endpoint");
+    assert_eq!(mismatch.code, "challenge_mismatch");
+    manager
+        .connect_challenge_response(
+            "ticket",
+            &challenge,
+            Some(Zeroizing::new(secret.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("valid ticket should connect without cancel");
+    manager.disconnect("ticket").await.unwrap();
+}
+
+#[tokio::test]
+async fn challenge_rejection_on_one_profile_does_not_block_another() {
+    let secret = fake_secret();
+    let echo = echo_server().await;
+    let ssh = ssh_server(secret.clone(), false).await;
+    let dir = tempfile::tempdir().unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        isolated_resolver(dir.path()),
+    );
+    let listen_a = free_port();
+    let listen_b = free_port();
+    let item_a = profile(
+        "ticket-a",
+        ssh.port(),
+        vec![mapping(Direction::Local, listen_a, echo.port())],
+        false,
+    );
+    let item_b = profile(
+        "ticket-b",
+        ssh.port(),
+        vec![mapping(Direction::Local, listen_b, echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item_a, item_b]).unwrap();
+    let challenge_a = manager
+        .connect(
+            "ticket-a",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("a needs password");
+    assert_eq!(challenge_a.code, "password_required");
+    let blocked = manager
+        .connect_with_challenge(
+            "ticket-a",
+            None,
+            None,
+            false,
+            false,
+            challenge_a.challenge_host.clone(),
+            Some("stale".into()),
+            challenge_a.challenge_endpoint.clone(),
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("stale ticket on a");
+    assert_eq!(blocked.code, "challenge_stale");
+    manager
+        .connect(
+            "ticket-b",
+            Some(Zeroizing::new(secret.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("profile b should connect while a waits for credentials");
+    manager
+        .connect_challenge_response(
+            "ticket-a",
+            &challenge_a,
+            Some(Zeroizing::new(secret)),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("profile a resumes without cancel");
+    manager.disconnect_all().await.unwrap();
 }

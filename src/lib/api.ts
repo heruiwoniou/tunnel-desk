@@ -5,6 +5,7 @@ import type {
   AppErrorBody,
   BackendInfo,
   ConnectRequest,
+  ForwardMapping,
   HistoryEntry,
   HostKeyEvent,
   Profile,
@@ -24,7 +25,16 @@ export function asAppError(error: unknown): AppErrorBody {
   if (error && typeof error === "object") {
     const record = error as Partial<AppErrorBody>
     if (typeof record.message === "string") {
-      return { code: record.code ?? "ssh", message: record.message }
+      return {
+        code: record.code ?? "ssh",
+        message: record.message,
+        challengeHost: record.challengeHost ?? null,
+        challengeHop: record.challengeHop ?? null,
+        challengeId: record.challengeId ?? null,
+        challengeEndpoint: record.challengeEndpoint ?? null,
+        runtimeApplied: record.runtimeApplied ?? null,
+        persistApplied: record.persistApplied ?? null,
+      }
     }
   }
   if (typeof error === "string" && error.trim()) {
@@ -131,12 +141,28 @@ export function connectProfile(request: ConnectRequest) {
   return invoke<{ snapshot: TunnelSnapshot; warnings: AppErrorBody[] }>("connect_profile", { request })
 }
 
+export function cancelConnect(profileId: string) {
+  return invoke<void>("cancel_connect", { profileId })
+}
+
 export function disconnectProfile(profileId: string) {
   return invoke<void>("disconnect_profile", { profileId })
 }
 
 export function disconnectAll() {
   return invoke<void>("disconnect_all")
+}
+
+export function addRuntimeForward(profileId: string, mapping: ForwardMapping, persist: boolean) {
+  return invoke<TunnelSnapshot>("add_runtime_forward", {
+    request: { profileId, mapping, persist },
+  })
+}
+
+export function removeRuntimeForward(profileId: string, forwardId: string, persist: boolean) {
+  return invoke<TunnelSnapshot>("remove_runtime_forward", {
+    request: { profileId, forwardId, persist },
+  })
 }
 
 export function respondHostKey(requestId: string, accept: boolean) {
@@ -151,6 +177,16 @@ export function onHostKey(handler: (prompt: HostKeyEvent) => void): Promise<Unli
   return listen<HostKeyEvent>("hostkey-required", (event) => handler(event.payload))
 }
 
-export function onNeedsInput(handler: (payload: { profileId: string; code: string; message: string }) => void) {
+export function onNeedsInput(
+  handler: (payload: {
+    profileId: string
+    code: string
+    message: string
+    challengeHost?: string | null
+    challengeHop?: string | null
+    challengeId?: string | null
+    challengeEndpoint?: string | null
+  }) => void,
+) {
   return listen<{ profileId: string; code: string; message: string }>("connect-needs-input", (event) => handler(event.payload))
 }

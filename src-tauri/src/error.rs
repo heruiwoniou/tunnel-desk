@@ -6,6 +6,18 @@ use serde::Serialize;
 pub struct AppError {
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_hop: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_applied: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_applied: Option<bool>,
 }
 
 impl AppError {
@@ -13,7 +25,39 @@ impl AppError {
         Self {
             code: code.into(),
             message: message.into(),
+            challenge_host: None,
+            challenge_hop: None,
+            challenge_id: None,
+            challenge_endpoint: None,
+            runtime_applied: None,
+            persist_applied: None,
         }
+    }
+
+    pub fn with_challenge(mut self, host: impl Into<String>, hop: impl Into<String>) -> Self {
+        self.challenge_host = Some(host.into());
+        self.challenge_hop = Some(hop.into());
+        self
+    }
+
+    pub fn with_challenge_ticket(
+        mut self,
+        host: impl Into<String>,
+        hop: impl Into<String>,
+        endpoint_key: impl Into<String>,
+        challenge_id: impl Into<String>,
+    ) -> Self {
+        self.challenge_host = Some(host.into());
+        self.challenge_hop = Some(hop.into());
+        self.challenge_endpoint = Some(endpoint_key.into());
+        self.challenge_id = Some(challenge_id.into());
+        self
+    }
+
+    pub fn with_persist_state(mut self, runtime: bool, persist: bool) -> Self {
+        self.runtime_applied = Some(runtime);
+        self.persist_applied = Some(persist);
+        self
     }
 }
 

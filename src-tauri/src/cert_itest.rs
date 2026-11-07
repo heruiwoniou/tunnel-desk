@@ -575,8 +575,9 @@ Host locked
     assert_eq!(missing.code, "passphrase_required");
     assert!(!missing.message.contains(&server.password));
     let wrong = app
-        .connect(
+        .connect_challenge_response(
             "locked",
+            &missing,
             None,
             Some(Zeroizing::new(server.password.clone())),
             false,
@@ -585,9 +586,10 @@ Host locked
         )
         .await
         .expect_err("login password is not the key passphrase");
-    assert_eq!(wrong.code, "auth_failed");
-    app.connect(
+    assert_eq!(wrong.code, "passphrase_rejected");
+    app.connect_challenge_response(
         "locked",
+        &wrong,
         None,
         Some(Zeroizing::new(passphrase.into())),
         false,

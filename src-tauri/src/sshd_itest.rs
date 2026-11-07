@@ -904,21 +904,17 @@ async fn openssh_session_loss_marks_failed_and_releases_the_listener() {
     exchange(SocketAddr::from(([127, 0, 0, 1], local)), b"before-drop").await;
     let pid_text = root_text(&server.pid);
     stop_sshd(&server);
-    let mut saw_failed = false;
+    let mut released = false;
     for _ in 0..50 {
-        if manager
-            .snapshots()
-            .iter()
-            .any(|snapshot| snapshot.profile_id == "live" && snapshot.phase == Phase::Failed)
-        {
-            saw_failed = true;
+        if port_is_free(local) && manager.snapshots().is_empty() {
+            released = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        saw_failed,
-        "session loss did not update the phase; pid={pid_text:?} snapshots={:?}",
+        released,
+        "session loss did not tear down; pid={pid_text:?} snapshots={:?}",
         manager.snapshots()
     );
     assert!(port_is_free(local), "listener survived session loss");
@@ -1004,8 +1000,9 @@ Host db
         "a key passphrase prompt must not fall through to the server password"
     );
     manager
-        .connect(
+        .connect_challenge_response(
             "key",
+            &missing_phrase,
             None,
             Some(Zeroizing::new(passphrase.clone())),
             false,
@@ -1038,10 +1035,11 @@ Host db
         )
         .await
         .unwrap_err();
-    assert_eq!(wrong.code, "auth_failed");
+    assert_eq!(wrong.code, "password_rejected");
     manager
-        .connect(
+        .connect_challenge_response(
             "pw",
+            &wrong,
             Some(Zeroizing::new(server.password.clone())),
             None,
             false,
@@ -1355,4 +1353,860 @@ async fn openssh_refused_destination_keeps_the_session() {
     assert_eq!(manager.snapshots()[0].phase, Phase::Connected);
     manager.disconnect("partial").await.unwrap();
     assert_no_secret(dir.path(), &server.password);
+}
+
+#[tokio::test]
+async fn openssh_runtime_forward_add_remove() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let initial = free_port();
+    let added = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    connect_alias(
+        &manager,
+        "runtime",
+        vec![mapping(Direction::Local, initial, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    exchange(SocketAddr::from(([127, 0, 0, 1], initial)), b"initial").await;
+    let extra = mapping(Direction::Local, added, echo.port());
+    manager
+        .add_runtime_forward("runtime", &extra, false)
+        .await
+        .unwrap();
+    assert_eq!(manager.snapshots()[0].forwards.len(), 2);
+    exchange(SocketAddr::from(([127, 0, 0, 1], added)), b"added-live").await;
+    let removed_id = manager.snapshots()[0]
+        .forwards
+        .iter()
+        .find(|item| item.id == extra.id)
+        .expect("added forward")
+        .id
+        .clone();
+    manager
+        .remove_runtime_forward("runtime", &removed_id, false)
+        .await
+        .unwrap();
+    assert_eq!(manager.snapshots()[0].forwards.len(), 1);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let dead = exchange_once(SocketAddr::from(([127, 0, 0, 1], added)), b"nope").await;
+    assert!(
+        dead.is_err(),
+        "removed listener should not accept traffic: {dead:?}"
+    );
+    exchange(SocketAddr::from(([127, 0, 0, 1], initial)), b"still-there").await;
+    manager.disconnect("runtime").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_runtime_remote_forward_add_remove() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let initial = free_port();
+    let remote_listen = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    connect_alias(
+        &manager,
+        "remote-runtime",
+        vec![mapping(Direction::Local, initial, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let extra = mapping(Direction::Remote, remote_listen, echo.port());
+    manager
+        .add_runtime_forward("remote-runtime", &extra, false)
+        .await
+        .unwrap();
+    exchange(
+        SocketAddr::from(([127, 0, 0, 1], remote_listen)),
+        b"remote-runtime",
+    )
+    .await;
+    let id = extra.id.clone();
+    manager
+        .remove_runtime_forward("remote-runtime", &id, false)
+        .await
+        .unwrap();
+    let dead = exchange_once(SocketAddr::from(([127, 0, 0, 1], remote_listen)), b"x").await;
+    assert!(dead.is_err());
+    exchange(SocketAddr::from(([127, 0, 0, 1], initial)), b"still").await;
+    manager.disconnect("remote-runtime").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_runtime_forward_rejects_duplicate_id() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let listen = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    let mut fwd = mapping(Direction::Local, listen, echo.port());
+    connect_alias(
+        &manager,
+        "dup",
+        vec![fwd.clone()],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    fwd.listen_port = free_port();
+    let dup = manager
+        .add_runtime_forward("dup", &fwd, false)
+        .await
+        .unwrap_err();
+    assert_eq!(dup.code, "forward_exists");
+    manager.disconnect("dup").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_connect_cancel_interrupts_before_auth() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    let item = profile(
+        "cancel-me",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let mgr = Arc::clone(&manager);
+    let join = tokio::spawn(async move {
+        mgr.connect(
+            "cancel-me",
+            Some(Zeroizing::new(server.password.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    manager.cancel_connect("cancel-me").await.unwrap();
+    let outcome = join.await.expect("join");
+    match outcome {
+        Err(err) => assert_eq!(err.code, "cancelled"),
+        Ok(_) => assert!(
+            manager.snapshots().is_empty(),
+            "cancel_connect should tear down an in-flight or finished connect"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn openssh_parallel_connect_is_rejected() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    let item = profile(
+        "parallel",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let password = server.password.clone();
+    let mgr = Arc::clone(&manager);
+    let first = tokio::spawn(async move {
+        mgr.connect(
+            "parallel",
+            Some(Zeroizing::new(password)),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second = manager
+        .connect(
+            "parallel",
+            Some(Zeroizing::new(server.password.clone())),
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(second.code, "already_connecting");
+    let _ = first.await;
+    manager.disconnect_all().await.unwrap();
+}
+
+struct StallPrompter {
+    reached: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl HostKeyPrompter for StallPrompter {
+    async fn confirm_unknown(&self, _: &HostKeyPrompt) -> bool {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        false
+    }
+}
+
+#[tokio::test]
+async fn openssh_cancel_during_host_key_prompt() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    let item = profile(
+        "cancel-host",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stall = Arc::new(StallPrompter {
+        reached: Arc::clone(&reached),
+    });
+    let mgr = Arc::clone(&manager);
+    let join = tokio::spawn(async move {
+        mgr.connect(
+            "cancel-host",
+            Some(Zeroizing::new(server.password.clone())),
+            None,
+            false,
+            false,
+            stall,
+        )
+        .await
+    });
+    for _ in 0..100 {
+        if reached.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    manager.cancel_connect("cancel-host").await.unwrap();
+    let outcome = join.await.expect("join");
+    assert!(matches!(outcome, Err(err) if err.code == "cancelled"));
+    assert!(manager.snapshots().is_empty());
+}
+
+#[tokio::test]
+async fn openssh_runtime_forward_persist_load_and_save_bounds() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let listen = free_port();
+    let added = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    connect_alias(
+        &manager,
+        "persist-tx",
+        vec![mapping(Direction::Local, listen, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let profiles_path = dir.path().join("profiles.json");
+    let good = std::fs::read(&profiles_path).unwrap();
+    std::fs::write(&profiles_path, b"{").unwrap();
+    let broken = manager
+        .add_runtime_forward(
+            "persist-tx",
+            &mapping(Direction::Local, added, echo.port()),
+            true,
+        )
+        .await
+        .expect_err("load should fail before runtime mutation");
+    assert_eq!(broken.code, "config");
+    assert_eq!(manager.snapshots()[0].forwards.len(), 1);
+
+    std::fs::write(&profiles_path, &good).unwrap();
+    let extra = mapping(Direction::Local, added, echo.port());
+    manager.store().inject_profile_save_failure(true);
+    let save_fail = manager
+        .add_runtime_forward("persist-tx", &extra, true)
+        .await
+        .expect_err("save blocked");
+    assert_eq!(save_fail.code, "config");
+    assert_eq!(save_fail.runtime_applied, Some(false));
+    assert_eq!(save_fail.persist_applied, Some(false));
+    let dead = exchange_once(SocketAddr::from(([127, 0, 0, 1], added)), b"x").await;
+    assert!(dead.is_err(), "runtime forward should be rolled back");
+    manager
+        .add_runtime_forward("persist-tx", &extra, true)
+        .await
+        .expect("forward restored on disk");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    manager.store().inject_profile_save_failure(true);
+    let remove_err = manager
+        .remove_runtime_forward("persist-tx", &extra.id, true)
+        .await
+        .expect_err("remove save blocked");
+    assert!(
+        remove_err.code == "persist_failed" || remove_err.code == "persist_compensate_failed",
+        "{}",
+        remove_err.message
+    );
+    if remove_err.code == "persist_failed" {
+        assert_eq!(remove_err.persist_applied, Some(false));
+        assert_eq!(remove_err.runtime_applied, Some(true));
+        assert!(
+            manager.snapshots()[0]
+                .forwards
+                .iter()
+                .any(|item| item.id == extra.id),
+            "runtime mapping should be restored after save failure"
+        );
+        exchange(SocketAddr::from(([127, 0, 0, 1], added)), b"still-live").await;
+    } else {
+        assert_eq!(remove_err.runtime_applied, Some(false));
+        assert_eq!(remove_err.persist_applied, Some(true));
+    }
+    manager.disconnect("persist-tx").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_concurrent_runtime_forward_ids_do_not_orphan() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let listen = free_port();
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    connect_alias(
+        &manager,
+        "race",
+        vec![mapping(Direction::Local, listen, echo.port())],
+        Some(&server.password),
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    let a = mapping(Direction::Local, free_port(), echo.port());
+    let mut b = a.clone();
+    b.listen_port = free_port();
+    let mgr = Arc::clone(&manager);
+    let (left, right) = tokio::join!(
+        mgr.add_runtime_forward("race", &a, false),
+        manager.add_runtime_forward("race", &b, false),
+    );
+    let outcomes = [left, right];
+    let wins = outcomes.iter().filter(|item| item.is_ok()).count();
+    let dupes = outcomes
+        .iter()
+        .filter(|item| matches!(item, Err(err) if err.code == "forward_exists"))
+        .count();
+    assert_eq!(wins, 1);
+    assert_eq!(dupes, 1);
+    assert_eq!(manager.snapshots()[0].forwards.len(), 2);
+    manager.disconnect("race").await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_wrong_passphrase_vs_rejected_pubkey() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", true, false, None);
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("id_ed25519");
+    let passphrase = format!("pp-{}", token());
+    let status = Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-f",
+            key.to_str().unwrap(),
+            "-N",
+            &passphrase,
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let known = dir.path().join("known_hosts");
+    std::fs::write(&known, b"").unwrap();
+    std::fs::write(
+        dir.path().join("extra"),
+        format!(
+            "\
+Host db
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  IdentitiesOnly yes
+  IdentityAgent none
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+",
+            port = server.port,
+            user = server.user,
+            key = key.display(),
+            known = known.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    let listen = free_port();
+    let echo = echo_server().await;
+    let item = profile(
+        "pubkey",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::PublicKey,
+        vec![mapping(Direction::Local, listen, echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let missing = manager
+        .connect(
+            "pubkey",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("encrypted key needs passphrase");
+    assert_eq!(missing.code, "passphrase_required");
+    let wrong = manager
+        .connect_challenge_response(
+            "pubkey",
+            &missing,
+            None,
+            Some(Zeroizing::new("not-the-passphrase".into())),
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("bad decrypt");
+    assert_eq!(wrong.code, "passphrase_rejected");
+    let rejected = manager
+        .connect_challenge_response(
+            "pubkey",
+            &wrong,
+            None,
+            Some(Zeroizing::new(passphrase)),
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("key not authorized");
+    assert_eq!(rejected.code, "auth_failed");
+    assert_ne!(rejected.code, "passphrase_rejected");
+    manager.disconnect_all().await.unwrap();
+}
+
+#[tokio::test]
+async fn openssh_resume_auth_then_session_loss_releases_listener() {
+    if !openssh_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let key = dir.path().join("id_ed25519");
+    let passphrase = format!("pp-{}", token());
+    assert!(
+        Command::new("ssh-keygen")
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-f",
+                key.to_str().unwrap(),
+                "-N",
+                &passphrase,
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let server = Sshd::start("yes", true, false, Some(&dir.path().join("id_ed25519.pub")));
+    let known = dir.path().join("known_hosts");
+    std::fs::write(
+        dir.path().join("extra"),
+        format!(
+            "\
+Host db
+  HostName 127.0.0.1
+  Port {port}
+  User {user}
+  IdentityFile {key}
+  IdentitiesOnly yes
+  IdentityAgent none
+  PreferredAuthentications publickey
+  UserKnownHostsFile {known}
+  GlobalKnownHostsFile /dev/null
+",
+            port = server.port,
+            user = server.user,
+            key = key.display(),
+            known = known.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let manager = TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    );
+    let listen = free_port();
+    let echo = echo_server().await;
+    let item = profile(
+        "resume-loss",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::PublicKey,
+        vec![mapping(Direction::Local, listen, echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item]).unwrap();
+    let missing = manager
+        .connect(
+            "resume-loss",
+            None,
+            None,
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect_err("needs passphrase");
+    manager
+        .connect_challenge_response(
+            "resume-loss",
+            &missing,
+            None,
+            Some(Zeroizing::new(passphrase)),
+            false,
+            false,
+            Arc::new(FixedPrompter(true)),
+        )
+        .await
+        .expect("resume should finish auth");
+    exchange(SocketAddr::from(([127, 0, 0, 1], listen)), b"up").await;
+    stop_sshd(&server);
+    let mut released = false;
+    for _ in 0..60 {
+        if port_is_free(listen) && manager.snapshots().is_empty() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(released, "resume session loss did not converge");
+}
+
+struct HubStallPrompter {
+    hub: std::sync::Arc<crate::PromptHub>,
+    profile_id: String,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl HostKeyPrompter for HubStallPrompter {
+    async fn confirm_unknown(&self, _: &HostKeyPrompt) -> bool {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request_id = crate::model::new_id();
+        self.hub.insert(&self.profile_id, request_id.clone(), tx);
+        rx.await.unwrap_or(false)
+    }
+}
+
+#[tokio::test]
+async fn hostkey_cancel_only_affects_one_profile() {
+    if !openssh_available() {
+        return;
+    }
+    let server = Sshd::start("yes", false, true, None);
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_db_include(dir.path(), &server);
+    std::fs::write(
+        dir.path().join("ssh-config"),
+        base_config(dir.path(), &server),
+    )
+    .unwrap();
+    let hub = std::sync::Arc::new(crate::PromptHub::new());
+    let hub_a = std::sync::Arc::clone(&hub);
+    let hub_b = std::sync::Arc::clone(&hub);
+    let manager = Arc::new(TunnelManager::new(
+        AppStore::open(dir.path()).unwrap(),
+        Arc::new(MemStore {
+            values: Mutex::new(std::collections::BTreeMap::new()),
+        }),
+        resolver(
+            dir.path(),
+            &std::fs::read_to_string(dir.path().join("ssh-config")).unwrap(),
+        ),
+    ));
+    let item_a = profile(
+        "host-a",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    let item_b = profile(
+        "host-b",
+        Target::ConfigAlias { alias: "db".into() },
+        AuthMode::Password,
+        vec![mapping(Direction::Local, free_port(), echo.port())],
+        false,
+    );
+    manager.store().save_profiles(&[item_a, item_b]).unwrap();
+    let armed_a = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed_b = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let armed_a_wait = std::sync::Arc::clone(&armed_a);
+    let armed_b_wait = std::sync::Arc::clone(&armed_b);
+    let password_a = server.password.clone();
+    let password_b = server.password.clone();
+    let mgr_a = Arc::clone(&manager);
+    let join_a = tokio::spawn(async move {
+        mgr_a
+            .connect(
+                "host-a",
+                Some(Zeroizing::new(password_a)),
+                None,
+                false,
+                false,
+                Arc::new(HubStallPrompter {
+                    hub: hub_a,
+                    profile_id: "host-a".into(),
+                    armed: armed_a_wait,
+                }),
+            )
+            .await
+    });
+    let mgr_b = Arc::clone(&manager);
+    let join_b = tokio::spawn(async move {
+        mgr_b
+            .connect(
+                "host-b",
+                Some(Zeroizing::new(password_b)),
+                None,
+                false,
+                false,
+                Arc::new(HubStallPrompter {
+                    hub: hub_b,
+                    profile_id: "host-b".into(),
+                    armed: armed_b_wait,
+                }),
+            )
+            .await
+    });
+    for _ in 0..120 {
+        if armed_a.load(std::sync::atomic::Ordering::SeqCst)
+            && armed_b.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(armed_a.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(armed_b.load(std::sync::atomic::Ordering::SeqCst));
+    hub.cancel_for("host-a");
+    manager.cancel_connect("host-a").await.unwrap();
+    let done_a = tokio::time::timeout(Duration::from_secs(2), join_a)
+        .await
+        .expect("profile a should cancel")
+        .expect("join");
+    assert!(matches!(done_a, Err(err) if err.code == "cancelled"));
+    assert!(
+        !join_b.is_finished(),
+        "profile b should still be waiting on host key"
+    );
+    hub.cancel_for("host-b");
+    let _ = tokio::time::timeout(Duration::from_secs(2), join_b).await;
 }

@@ -16,6 +16,9 @@ struct ConnectRequest {
     key_passphrase: Option<String>,
     remember_server_password: bool,
     remember_key_passphrase: bool,
+    challenge_host: Option<String>,
+    challenge_id: Option<String>,
+    challenge_endpoint: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -38,6 +41,7 @@ struct HostKeyEvent {
 struct GuiPrompter {
     app: AppHandle,
     hub: Arc<crate::PromptHub>,
+    profile_id: String,
 }
 
 #[async_trait::async_trait]
@@ -45,7 +49,7 @@ impl HostKeyPrompter for GuiPrompter {
     async fn confirm_unknown(&self, prompt: &HostKeyPrompt) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request_id = crate::model::new_id();
-        self.hub.insert(request_id.clone(), tx);
+        self.hub.insert(&self.profile_id, request_id.clone(), tx);
         let _ = self.app.emit(
             "hostkey-required",
             HostKeyEvent {
@@ -74,10 +78,11 @@ fn seal(value: Option<String>) -> Option<Zeroizing<String>> {
     })
 }
 
-fn prompter(app: &AppHandle, state: &AppState) -> Arc<GuiPrompter> {
+fn prompter(app: &AppHandle, state: &AppState, profile_id: &str) -> Arc<GuiPrompter> {
     Arc::new(GuiPrompter {
         app: app.clone(),
         hub: state.prompts.clone(),
+        profile_id: profile_id.to_string(),
     })
 }
 
@@ -220,14 +225,17 @@ async fn connect_profile(
     request: ConnectRequest,
 ) -> Result<ConnectOutcome, AppError> {
     let manager = state.manager.clone();
-    let prompter = prompter(&app, &state);
+    let prompter = prompter(&app, &state, &request.profile_id);
     let outcome = manager
-        .connect(
+        .connect_with_challenge(
             &request.profile_id,
             seal(request.server_password),
             seal(request.key_passphrase),
             request.remember_server_password,
             request.remember_key_passphrase,
+            request.challenge_host,
+            request.challenge_id,
+            request.challenge_endpoint,
             prompter,
         )
         .await?;
@@ -256,6 +264,52 @@ async fn disconnect_all(app: AppHandle, state: State<'_, AppState>) -> Result<()
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeForwardRequest {
+    profile_id: String,
+    mapping: crate::model::ForwardMapping,
+    persist: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeForwardRemove {
+    profile_id: String,
+    forward_id: String,
+    persist: bool,
+}
+
+#[tauri::command]
+async fn add_runtime_forward(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RuntimeForwardRequest,
+) -> Result<TunnelSnapshot, AppError> {
+    let snapshot = state
+        .manager
+        .add_runtime_forward(&request.profile_id, &request.mapping, request.persist)
+        .await?;
+    crate::tray::refresh(&state);
+    let _ = app.emit("tunnel-state", state.manager.snapshots());
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn remove_runtime_forward(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RuntimeForwardRemove,
+) -> Result<TunnelSnapshot, AppError> {
+    let snapshot = state
+        .manager
+        .remove_runtime_forward(&request.profile_id, &request.forward_id, request.persist)
+        .await?;
+    crate::tray::refresh(&state);
+    let _ = app.emit("tunnel-state", state.manager.snapshots());
+    Ok(snapshot)
+}
+
 pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         backend_info,
@@ -277,8 +331,23 @@ pub fn invoke_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Sen
         respond_host_key,
         connect_profile,
         disconnect_profile,
-        disconnect_all
+        disconnect_all,
+        add_runtime_forward,
+        remove_runtime_forward,
+        cancel_connect,
     ]
+}
+
+#[tauri::command]
+async fn cancel_connect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> Result<(), AppError> {
+    state.prompts.cancel_for(&profile_id);
+    state.manager.cancel_connect(&profile_id).await?;
+    let _ = app.emit("tunnel-state", state.manager.snapshots());
+    Ok(())
 }
 
 pub async fn connect_from_tray(
@@ -290,6 +359,7 @@ pub async fn connect_from_tray(
     let prompter = Arc::new(GuiPrompter {
         app: app.clone(),
         hub: prompts.clone(),
+        profile_id: profile_id.to_string(),
     });
     match manager
         .connect(profile_id, None, None, false, false, prompter)
@@ -301,20 +371,26 @@ pub async fn connect_from_tray(
         Err(err)
             if err.code == "password_required"
                 || err.code == "passphrase_required"
-                || err.code == "host_key_rejected" =>
+                || err.code == "password_rejected"
+                || err.code == "passphrase_rejected" =>
         {
             reveal(app);
             let _ = app.emit(
                 "connect-needs-input",
-                serde_json::json!({ "profileId": profile_id, "code": err.code, "message": err.message }),
+                serde_json::json!({
+                    "profileId": profile_id,
+                    "code": err.code,
+                    "message": err.message,
+                    "challengeHost": err.challenge_host,
+                    "challengeHop": err.challenge_hop,
+                    "challengeId": err.challenge_id,
+                    "challengeEndpoint": err.challenge_endpoint,
+                }),
             );
         }
-        Err(err) => {
+        Err(_) => {
             reveal(app);
-            let _ = app.emit(
-                "connect-needs-input",
-                serde_json::json!({ "profileId": profile_id, "code": err.code, "message": err.message }),
-            );
+            let _ = app.emit("tunnel-state", manager.snapshots());
         }
     }
 }
@@ -323,6 +399,11 @@ pub fn reveal(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_always_on_top(false);
+        }
         let _ = window.set_focus();
     }
 }
