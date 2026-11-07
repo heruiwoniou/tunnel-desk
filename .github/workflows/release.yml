@@ -1,0 +1,176 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "SemVer tag to publish, including v. Example: v0.1.0"
+        required: true
+        type: string
+      confirm:
+        description: "Type publish to build and publish a GitHub Release."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: validate tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Select tag
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_TAG: ${{ github.event.inputs.tag }}
+          DISPATCH_CONFIRM: ${{ github.event.inputs.confirm }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${DISPATCH_CONFIRM}" != "publish" ]]; then
+              echo "Set confirm to publish to create a GitHub Release." >&2
+              exit 1
+            fi
+            if [[ -z "${DISPATCH_TAG}" ]]; then
+              echo "A tag is required." >&2
+              exit 1
+            fi
+            printf 'tag=%s\n' "${DISPATCH_TAG}" >> "${GITHUB_OUTPUT}"
+            printf 'confirm=%s\n' "publish" >> "${GITHUB_OUTPUT}"
+          else
+            printf 'tag=%s\n' "${REF_NAME}" >> "${GITHUB_OUTPUT}"
+            printf 'confirm=%s\n' "tag-push" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Check version, changelog, and tag
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.select.outputs.tag }}
+          RELEASE_CONFIRM: ${{ steps.select.outputs.confirm }}
+        run: node scripts/version.mjs release-check
+
+  checks:
+    name: checks
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Verify
+        uses: ./.github/actions/verify
+        with:
+          rust-target: x86_64-unknown-linux-gnu
+
+  package:
+    name: package (${{ matrix.platform }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb
+            cargo-test: "false"
+            apple-adhoc: "false"
+          - platform: windows-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: auto
+            cargo-test: "true"
+            apple-adhoc: "false"
+          - platform: macos-aarch64
+            os: macos-26
+            target: aarch64-apple-darwin
+            bundles: dmg
+            cargo-test: "true"
+            apple-adhoc: "true"
+          - platform: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            cargo-test: "true"
+            apple-adhoc: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Package
+        uses: ./.github/actions/package-host
+        with:
+          rust-target: ${{ matrix.target }}
+          platform: ${{ matrix.platform }}
+          bundles: ${{ matrix.bundles }}
+          cargo-test: ${{ matrix.cargo-test }}
+          apple-adhoc: ${{ matrix.apple-adhoc }}
+          upload: "true"
+
+  publish:
+    name: publish
+    needs:
+      - validate
+      - checks
+      - package
+    if: needs.validate.result == 'success' && needs.checks.result == 'success' && needs.package.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Download installers
+        uses: actions/download-artifact@v8
+        with:
+          pattern: tunneldesk-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_ASSETS: release-assets
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: bash scripts/publish-release.sh

@@ -1,42 +1,79 @@
-# Template only. This workflow is not an executed CI run.
-# Origin does not run GitHub Actions for this draft.
 name: ci
 
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  verify:
+  checks:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Verify
+        uses: ./.github/actions/verify
+        with:
+          rust-target: x86_64-unknown-linux-gnu
+
+  package:
+    name: package (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - platform: linux-amd64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb
+            cargo-test: "false"
+            apple-adhoc: "false"
+          - platform: windows-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundles: auto
+            cargo-test: "true"
+            apple-adhoc: "false"
+          - platform: macos-aarch64
+            os: macos-26
+            target: aarch64-apple-darwin
+            bundles: dmg
+            cargo-test: "true"
+            apple-adhoc: "true"
+          - platform: macos-x64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: dmg
+            cargo-test: "true"
+            apple-adhoc: "true"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Package
+        uses: ./.github/actions/package-host
         with:
-          components: rustfmt, clippy
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-      - name: Linux desktop packages
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libsecret-1-dev
-      - run: npm ci
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
-      - name: Rust tests
-        working-directory: src-tauri
-        run: |
-          cargo fmt --check
-          cargo test
-      - name: Linux package
-        if: runner.os == 'Linux'
-        run: npm run tauri build -- --bundles deb
+          rust-target: ${{ matrix.target }}
+          platform: ${{ matrix.platform }}
+          bundles: ${{ matrix.bundles }}
+          cargo-test: ${{ matrix.cargo-test }}
+          apple-adhoc: ${{ matrix.apple-adhoc }}
+          upload: ${{ github.event.pull_request.head.repo.fork != true }}

@@ -153,7 +153,7 @@ npm run tauri build -- --bundles app          # macOS
 npm run tauri build -- --bundles msi nsis     # Windows
 ```
 
-`.github/workflows/ci.yml` 是一份 Ubuntu / macOS / Windows 的检查与打包模板。Origin 草稿不会运行 GitHub Actions。它不是一次已经通过的 CI，也不能当成原生构建通过。
+GitHub Actions 的检查和安装包构建写在 `.github/workflows/ci.yml`，发布写在 `.github/workflows/release.yml`。版本、Changelog 和第一次发布的步骤见 [docs/releasing.md](docs/releasing.md)。工作流产物是未签名安装包。安装包构建成功不等于 Windows 或 macOS 上的窗口、托盘和钥匙串已经验证。
 
 包标识是 `dev.tunneldesk.desktop`，不以 `.app` 结尾。钥匙串服务名使用同一个字符串，并有测试锁住两者一致。
 
@@ -238,4 +238,4 @@ russh 测试服务器仍覆盖：双向数据、断开释放端口、错误口�
 - 本机没有可点击的托盘宿主（会话总线上没有 `org.kde.StatusNotifierWatcher`）。托盘菜单的显示、隐藏、恢复和退出没有被点击验证。没有宿主时关闭窗口会退出并清理。
 - 不修改服务器的 `GatewayPorts`。远程转发默认只出现在服务器的回环地址上。
 - 未做自动更新、多用户和同步。
-- Windows 和 macOS 没有在对应机器上编译。列出的打包目标和工作流模板都不是已通过的原生构建。
+- Windows 和 macOS 没有在这台虚拟机上编译。GitHub Actions 会在对应系统上打未签名安装包；那次构建成功仍然不等于窗口、托盘或钥匙串已经在该系统上验证。

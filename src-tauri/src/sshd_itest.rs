@@ -118,7 +118,11 @@ impl Drop for Sshd {
 }
 
 fn openssh_available() -> bool {
+    // The fixture creates a disposable account with Linux useradd/userdel.
+    // macOS runners have sshd and passwordless sudo, but not useradd, so the
+    // tests skip there instead of failing the whole suite.
     Path::new("/usr/sbin/sshd").is_file()
+        && Path::new("/usr/sbin/useradd").is_file()
         && Command::new("sudo")
             .args(["-n", "true"])
             .status()

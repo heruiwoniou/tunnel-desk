@@ -10,6 +10,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src",
     "test": "vitest run",
+    "version:check": "node scripts/version.mjs check",
+    "version:prepare": "node scripts/version.mjs prepare",
+    "version:notes": "node scripts/version.mjs notes",
     "tauri": "tauri"
   },
   "dependencies": {
