@@ -2203,7 +2203,10 @@ async fn hostkey_cancel_only_affects_one_profile() {
         .expect("profile a should cancel")
         .expect("join");
     assert!(matches!(done_a, Err(err) if err.code == "cancelled"));
-    assert!(!join_b.is_finished(), "profile b should still be waiting on host key");
+    assert!(
+        !join_b.is_finished(),
+        "profile b should still be waiting on host key"
+    );
     hub.cancel_for("host-b");
     let _ = tokio::time::timeout(Duration::from_secs(2), join_b).await;
 }
